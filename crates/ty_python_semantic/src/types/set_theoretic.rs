@@ -47,6 +47,39 @@ impl get_size2::GetSize for UnionType<'_> {}
 
 #[salsa::tracked]
 impl<'db> UnionType<'db> {
+    /// Combine alternatives without asking whether one is a subtype of another.
+    /// Recursive type construction uses this before a relation has begun inspecting the result.
+    pub(super) fn from_elements_structural(
+        db: &'db dyn Db,
+        elements: impl IntoIterator<Item = Type<'db>>,
+        mut recursively_defined: RecursivelyDefined,
+    ) -> Type<'db> {
+        let mut pending: Vec<_> = elements.into_iter().collect();
+        pending.reverse();
+        let mut elements = FxOrderSet::default();
+        while let Some(element) = pending.pop() {
+            match element {
+                Type::Union(union) => {
+                    recursively_defined = recursively_defined.or(union.recursively_defined(db));
+                    pending.extend(union.elements(db).iter().rev().copied());
+                }
+                Type::Never => {}
+                ty => {
+                    elements.insert(ty);
+                }
+            }
+        }
+        match elements.len() {
+            0 => Type::Never,
+            1 => elements[0],
+            _ => Type::Union(Self::new(
+                db,
+                elements.into_iter().collect::<Box<[_]>>(),
+                recursively_defined,
+            )),
+        }
+    }
+
     /// Create a union from a list of elements
     /// (which may be eagerly simplified into a different variant of [`Type`] altogether).
     ///
@@ -283,15 +316,14 @@ impl<'db> UnionType<'db> {
         tcx: TypeContext<'db>,
         visitor: &ApplyTypeMappingVisitor<'_, 'db>,
     ) -> Type<'db> {
-        if type_mapping.is_structural() {
-            Type::Union(UnionType::new(
+        if type_mapping.is_structural() || !visitor.normalize_unions {
+            Self::from_elements_structural(
                 db,
                 self.elements(db)
                     .iter()
-                    .map(|element| element.apply_type_mapping_impl(db, type_mapping, tcx, visitor))
-                    .collect::<Box<[_]>>(),
+                    .map(|element| element.apply_type_mapping_impl(db, type_mapping, tcx, visitor)),
                 self.recursively_defined(db),
-            ))
+            )
         } else {
             self.map_leave_aliases(db, visitor.env, |element| {
                 element.apply_type_mapping_impl(db, type_mapping, tcx, visitor)

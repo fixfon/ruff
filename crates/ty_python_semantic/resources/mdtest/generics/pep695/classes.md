@@ -431,6 +431,126 @@ def as_shape_class[T: Other](cls: type[T]) -> TypeOf[Shape[int]]:
     return cls  # error: [invalid-return-type]
 ```
 
+## Reading recursively specialized extra items
+
+Each extra item is another `Node` whose value is a list. A known key retains its declared type:
+
+```py
+from typing_extensions import ReadOnly, TypedDict
+
+class Node[T](TypedDict, extra_items=ReadOnly["Node[list[T]]"]):
+    value: T
+
+def read_value(node: Node[int]):
+    reveal_type(node.get("value"))  # revealed: int
+```
+
+An arbitrary key can select the declared field or an extra item, or be absent:
+
+```py
+def read_key(node: Node[int], key: str):
+    reveal_type(node.get(key))  # revealed: int | Node[list[int]] | None
+```
+
+The corresponding `Mapping` includes both value types. Omitting the extra-item type is an error:
+
+```py
+from collections.abc import Mapping
+
+def as_mapping(node: Node[int]):
+    values: Mapping[str, int | Node[list[int]]] = node  # no diagnostic
+    invalid: Mapping[str, int] = node  # error: [invalid-assignment]
+```
+
+## Unions in recursively specialized extra items
+
+An extra-item union can combine a type argument with a recursive specialization. Reading an
+arbitrary key includes each alternative once:
+
+```py
+from typing_extensions import ReadOnly, TypedDict
+
+class Node[T](TypedDict, extra_items=ReadOnly["Node[list[T]] | T"]):
+    value: T
+
+def read(node: Node[int], key: str):
+    reveal_type(node.get(key))  # revealed: int | Node[list[int]] | None
+```
+
+## Specializing extra-item types to Never
+
+An extra-item type that specializes to `Never` makes the `TypedDict` closed. Its keys are limited to
+the declared fields:
+
+```py
+from typing_extensions import ReadOnly, TypedDict
+from ty_extensions import Intersection
+
+class Record[T](TypedDict, extra_items=ReadOnly[Intersection[T, str]]):
+    value: int
+
+def check(record: Record[int]):
+    reveal_type(record.keys())  # revealed: dict_keys[Literal["value"], int]
+```
+
+## Reading recursively specialized fields in a closed TypedDict
+
+A closed `TypedDict` has no extra items, but its declared fields can still specialize the same
+`TypedDict` recursively:
+
+```py
+from typing_extensions import TypedDict
+
+class Node[T](TypedDict, closed=True):
+    value: T
+    child: "Node[list[T]]"
+```
+
+Reading `child` preserves its specialization. For an arbitrary key, `get` combines both field types
+and `None`:
+
+```py
+def read(node: Node[int], key: str):
+    reveal_type(node.get("child"))  # revealed: Node[list[int]]
+    reveal_type(node.get(key))  # revealed: Node[list[int]] | int | None
+```
+
+## Materialized extra items
+
+Materializing `Record[Any]` applies to its extra items as well as its fields, even though `T` is
+invariant:
+
+```py
+from typing import Any
+from typing_extensions import NotRequired, ReadOnly, TypedDict
+from ty_extensions import Top, Bottom
+
+class Record[T](TypedDict, extra_items=ReadOnly[T]):
+    value: NotRequired[T]
+
+def check(maximum: Top[Record[Any]], minimum: Bottom[Record[Any]]):
+    reveal_type(maximum.get("other"))  # revealed: object
+    reveal_type(minimum.get("other"))  # revealed: None
+```
+
+## Reusing TypedDict values in a loop
+
+Each iteration puts the previous dictionary view into a new `Node`. Inference retains the initial
+specialization and uses `Divergent` for the type argument that would otherwise keep growing:
+
+```py
+from typing_extensions import TypedDict
+
+class Node[T](TypedDict, closed=True):
+    value: T
+
+def check(condition: bool):
+    node = Node(value=0)
+    while condition:
+        node = Node(value=node.values())
+    reveal_type(node)  # revealed: Node[int] | Node[Divergent]
+```
+
 ## Diagnostics for bad specializations
 
 We show the user where the type variable was defined if a specialization is given that doesn't

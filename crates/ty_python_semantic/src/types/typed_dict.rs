@@ -18,15 +18,16 @@ use super::diagnostic::{
 };
 use super::infer::{TypeExpressionFlags, infer_deferred_types};
 use super::{
-    ApplyTypeMappingVisitor, BoundTypeVarIdentity, ErrorContext, IntersectionType, Type,
-    TypeMapping, TypeQualifiers, TypeVarVariance, UnionBuilder, VarianceInferable, VarianceTerm,
-    definition_expression_annotation, definition_expression_type, visitor,
+    ApplyTypeMappingVisitor, BoundTypeVarIdentity, ErrorContext, IntersectionType, RecursiveType,
+    Type, TypeMapping, TypeQualifiers, TypeVarVariance, UnionBuilder, UnionType, VarianceInferable,
+    VarianceTerm, definition_expression_annotation, definition_expression_type, visitor,
 };
 use crate::types::TypeContext;
 use crate::types::TypeDefinition;
 use crate::types::class::FieldKind;
 use crate::types::constraints::{ConstraintSet, IteratorConstraintsExtension};
 use crate::types::relation::{DisjointnessChecker, TypeRelation, TypeRelationChecker};
+use crate::types::set_theoretic::RecursivelyDefined;
 use crate::types::variance::VarianceOrigin;
 use crate::{Db, ProgramEnvironment};
 use ty_python_core::Truthiness;
@@ -302,11 +303,25 @@ impl<'db> TypedDictType<'db> {
                 .expect("StaticClassLiteral definition should be a class")
                 .node(&module);
 
+            // The extra-item type is part of the schema being constructed. Comparing its union
+            // elements here can ask for another specialization of this same schema.
+            let visitor = ApplyTypeMappingVisitor::new_without_union_normalization(&env);
+            let specialize = |ty: Type<'db>| {
+                specialization.map_or(ty, |specialization| {
+                    ty.apply_type_mapping_impl(
+                        db,
+                        &TypeMapping::from_specialization(db, specialization, false),
+                        TypeContext::default(),
+                        &visitor,
+                    )
+                })
+            };
+
             if let Some(arguments) = &class_stmt.arguments {
                 if let Some(extra_items) = arguments.find_keyword("extra_items") {
                     let annotation =
                         definition_expression_annotation(db, class_definition, &extra_items.value)
-                            .map_type(|ty| ty.apply_optional_specialization(db, specialization));
+                            .map_type(specialize);
                     return TypedDictOpenness::extra(
                         db,
                         annotation.inner_type(),
@@ -325,7 +340,7 @@ impl<'db> TypedDictType<'db> {
             }
 
             for base in static_class.explicit_bases(db) {
-                let base = base.apply_optional_specialization(db, specialization);
+                let base = specialize(*base);
                 let base_class = match base {
                     Type::ClassLiteral(base) => ClassType::NonGeneric(base),
                     Type::GenericAlias(base) => ClassType::Generic(base),
@@ -356,22 +371,41 @@ impl<'db> TypedDictType<'db> {
 
     /// Returns a type that contains every value that may be stored in this `TypedDict`.
     ///
-    /// An implicitly open `TypedDict` immediately returns `object` because hidden items may have
-    /// any value type. This also avoids unnecessarily materializing its declared items.
+    /// A projection with a source declaration stays deferred so a mapping comparison can inspect its
+    /// values under the same recursion guard as the enclosing relation.
     pub(crate) fn value_type(self, db: &'db dyn Db, env: &ProgramEnvironment<'db>) -> Type<'db> {
+        if let Some(class) = self.defining_class()
+            && let Some(recursive) = RecursiveType::typed_dict_values(db, class)
+        {
+            Type::Recursive(recursive)
+        } else {
+            UnionBuilder::new(db, env)
+                .add(self.unfold_value_type(db))
+                .build()
+        }
+    }
+
+    /// Expose the value alternatives without starting another relation during construction.
+    /// An implicitly open `TypedDict` returns `object` without inspecting its declared items,
+    /// because its hidden items may have any value type.
+    pub(super) fn unfold_value_type(self, db: &'db dyn Db) -> Type<'db> {
         let openness = self.openness(db);
         if openness.is_implicitly_open() {
             return Type::object();
         }
 
-        let mut builder = UnionBuilder::new(db, env);
-        for field in self.items(db).values() {
-            builder = builder.add(field.declared_ty);
-        }
-        if let Some(extra_items) = openness.explicit_extra_items() {
-            builder = builder.add(extra_items.declared_ty);
-        }
-        builder.build()
+        UnionType::from_elements_structural(
+            db,
+            self.items(db)
+                .values()
+                .map(|field| field.declared_ty)
+                .chain(
+                    openness
+                        .explicit_extra_items()
+                        .map(|extra| extra.declared_ty),
+                ),
+            RecursivelyDefined::No,
+        )
     }
 
     /// Returns the type of keys that may be present in this `TypedDict`.

@@ -720,6 +720,20 @@ impl<'db> UnionBuilder<'db> {
 
     fn add_in_place_impl(&mut self, ty: Type<'db>, seen_aliases: &mut Vec<Type<'db>>) {
         let db = self.db;
+        // An unnamed recursive type has no alias name to preserve. Expose its completed body here,
+        // after construction, so ordinary unions retain their normalized form.
+        if let Type::Recursive(recursive) = ty
+            && recursive.alias(db).is_none()
+        {
+            if seen_aliases.contains(&ty) {
+                return;
+            }
+            if let Some(unfolded) = recursive.unfold(db, &self.env).into_unfolded() {
+                seen_aliases.push(ty);
+                self.add_in_place_impl(unfolded, seen_aliases);
+                return;
+            }
+        }
         let cycle_recovery = self.cycle_recovery;
         let should_widen = |literals, recursively_defined: RecursivelyDefined| {
             if recursively_defined.is_yes() && cycle_recovery {

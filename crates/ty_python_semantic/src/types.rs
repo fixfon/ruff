@@ -514,6 +514,8 @@ type MaterializationEquivalenceVisitor<'db> =
 pub(crate) struct ApplyTypeMappingVisitor<'env, 'db> {
     env: &'env ProgramEnvironment<'db>,
     recursion_context: Option<&'env TypeRecursionContext<'db>>,
+    /// Whether transformed unions can compare their alternatives for redundancy.
+    normalize_unions: bool,
     /// Whether materialization also transforms type-variable bounds and defaults.
     materialize_typevar_bounds_and_defaults: bool,
     default: OnceCell<Box<TypeTransformer<'db, ApplyTypeMappingTag>>>,
@@ -531,6 +533,7 @@ impl<'env, 'db> ApplyTypeMappingVisitor<'env, 'db> {
         Self {
             env,
             recursion_context: None,
+            normalize_unions: true,
             materialize_typevar_bounds_and_defaults: true,
             default: OnceCell::default(),
             top_materialization: OnceCell::default(),
@@ -540,6 +543,14 @@ impl<'env, 'db> ApplyTypeMappingVisitor<'env, 'db> {
             promotion: OnceCell::default(),
             skip_promotion: OnceCell::default(),
             materialization_equivalence: OnceCell::default(),
+        }
+    }
+
+    /// Postpone redundancy checks while substituting into a union.
+    fn new_without_union_normalization(env: &'env ProgramEnvironment<'db>) -> Self {
+        Self {
+            normalize_unions: false,
+            ..Self::new(env)
         }
     }
 
@@ -3812,7 +3823,9 @@ impl<'db> Type<'db> {
             Type::GenericAlias(generic) => generic
                 .recursive_type_normalized_impl(db, env, div, nested)
                 .map(Type::GenericAlias),
-            Type::Recursive(_) => Some(self),
+            Type::Recursive(recursive) => recursive
+                .recursive_type_normalized_impl(db, env, div, nested)
+                .map(Type::Recursive),
             Type::ClassLiteral(class) => class
                 .recursive_type_normalized_impl(db, env, div, nested)
                 .map(Type::ClassLiteral),
@@ -9428,17 +9441,8 @@ impl<'db> Type<'db> {
         specialize_self_domain: bool,
     ) -> Type<'db> {
         let env = &ProgramEnvironment::from_program(specialization.generic_context(db).program(db));
-        let apply_specialization = ApplySpecialization::Specialization {
-            specialization,
-            specialize_self_domain,
-        };
-        let type_mapping = match specialization.materialization_kind(db) {
-            None => TypeMapping::ApplySpecialization(apply_specialization),
-            Some(materialization_kind) => TypeMapping::ApplySpecializationWithMaterialization {
-                specialization: apply_specialization,
-                materialization_kind,
-            },
-        };
+        let type_mapping =
+            TypeMapping::from_specialization(db, specialization, specialize_self_domain);
 
         self.apply_type_mapping(db, env, &type_mapping, TypeContext::default())
     }
@@ -11172,6 +11176,26 @@ pub enum TypeMapping<'a, 'db> {
 }
 
 impl<'db> TypeMapping<'_, 'db> {
+    /// Build a substitution while retaining its pending materialization.
+    fn from_specialization(
+        db: &'db dyn Db,
+        specialization: Specialization<'db>,
+        specialize_self_domain: bool,
+    ) -> Self {
+        let materialization_kind = specialization.materialization_kind(db);
+        let specialization = ApplySpecialization::Specialization {
+            specialization,
+            specialize_self_domain,
+        };
+        match materialization_kind {
+            None => Self::ApplySpecialization(specialization),
+            Some(materialization_kind) => Self::ApplySpecializationWithMaterialization {
+                specialization,
+                materialization_kind,
+            },
+        }
+    }
+
     /// Update the generic context of a [`Signature`] according to the current type mapping
     fn update_signature_generic_context(
         &self,

@@ -36,8 +36,8 @@ use crate::types::{
     CallableType, IntersectionType, KnownBoundMethodType, KnownClass, KnownInstanceType,
     KnownUnion, LiteralValueType, LiteralValueTypeKind, MaterializationKind, PropertyInstanceClass,
     PropertyInstanceType, Protocol, SpecialFormType, SubclassOfInner, SubclassOfType, Type,
-    TypeAliasType, TypeGuardLike, TypedDictType, TypingModule, UnionType, WrapperDescriptorKind,
-    visitor,
+    TypeAliasType, TypeGuardLike, TypedDictType, TypingModule, UnionBuilder, UnionType,
+    WrapperDescriptorKind, visitor,
 };
 use ty_python_core::ProgramFile;
 use ty_python_core::definition::Definition;
@@ -689,7 +689,9 @@ impl<'db> TypeVisitor<'db> for AmbiguousNameCollector<'_, 'db> {
                 self.record_class(db, ClassLiteral::Static(alias.origin(db)));
             }
             Type::TypeAlias(type_alias) => self.record_type_alias(db, type_alias),
-            Type::Recursive(recursive) => self.record(db, NamedItem::Recursive(recursive)),
+            Type::Recursive(recursive) if recursive.alias(db).is_some() => {
+                self.record(db, NamedItem::Recursive(recursive));
+            }
             // Visit the class (as if it were a nominal-instance type)
             // rather than the protocol members, if it is a class-based protocol.
             // (For the purposes of displaying the type, we'll use the class name.)
@@ -711,6 +713,12 @@ impl<'db> TypeVisitor<'db> for AmbiguousNameCollector<'_, 'db> {
     }
 
     fn visit_recursive_type(&self, db: &'db dyn Db, recursive: RecursiveType<'db>) {
+        if recursive.alias(db).is_none() {
+            if let Some(unfolded) = recursive.unfold(db, self.env).into_unfolded() {
+                self.visit_type(db, unfolded);
+            }
+            return;
+        }
         // Only the alias name and its arguments are displayed, not its unfolded body.
         if let Some(arguments) = recursive.arguments(db) {
             walk_specialization_types(db, arguments, self);
@@ -1797,6 +1805,17 @@ impl<'db> FmtDetailed<'db> for DisplayRepresentation<'_, 'db> {
                     alias.materialization_kind(db),
                     f,
                 ),
+            Type::Recursive(recursive) if recursive.alias(db).is_none() => {
+                let normalized = UnionBuilder::new(db, self.env).add(self.ty).build();
+                if normalized == self.ty {
+                    f.set_invalid_type_annotation();
+                    f.write_str("...")
+                } else {
+                    normalized
+                        .display_with(db, self.env, self.settings.clone())
+                        .fmt_detailed(f)
+                }
+            }
             Type::Recursive(recursive) => TypeAliasDisplay {
                 db,
                 ty: self.ty,

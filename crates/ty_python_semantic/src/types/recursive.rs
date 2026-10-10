@@ -59,7 +59,14 @@
 //! ```
 //!
 //! Tuple subscripting then selects the element at index 1: `x[1]: Tree[list[int]] | None`.
+//!
+//! A constructor can also defer a type derived from a declaration. The value projection of a
+//! `TypedDict` is the union of its declared field types and extra-item types. Storing that
+//! projection without expanding it lets a mapping comparison establish the class relationship
+//! before inspecting the values. These projections have no source alias name; ordinary union
+//! construction and type display expand their completed bodies.
 
+use salsa::plumbing::AsId;
 use ty_python_core::definition::Definition;
 use ty_python_core::place_table;
 
@@ -69,8 +76,8 @@ use super::relation::{TypeRelation, TypeRelationChecker};
 use super::type_alias::AliasCycleSummary;
 use super::variance::{VarianceInferable, VarianceOrigin};
 use super::{
-    ApplyTypeMappingVisitor, BoundTypeVarIdentity, GenericContext, MaterializationKind, Type,
-    TypeContext, TypeMapping, VarianceTerm,
+    ApplyTypeMappingVisitor, BoundTypeVarIdentity, ClassLiteral, ClassType, GenericContext,
+    MaterializationKind, Type, TypeContext, TypeMapping, TypedDictType, VarianceTerm,
 };
 use crate::{Db, ProgramEnvironment};
 
@@ -140,11 +147,29 @@ impl RecursiveSubstitution<'_> {
     }
 }
 
-/// Identifies an alias query and names its recursive binder and variables.
+/// Identifies a recursive binder or a deferred value projection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct RecursiveCycle(salsa::Id);
+pub enum RecursiveCycle {
+    Alias(salsa::Id),
+    TypedDictValues(salsa::Id),
+}
 
 impl get_size2::GetSize for RecursiveCycle {}
+
+impl RecursiveCycle {
+    fn id(self) -> salsa::Id {
+        match self {
+            Self::Alias(id) | Self::TypedDictValues(id) => id,
+        }
+    }
+}
+
+/// A stored recursive expression or a projection that can expose another recursive type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, get_size2::GetSize, salsa::SalsaValue)]
+pub enum RecursiveBody<'db> {
+    Type(Type<'db>),
+    TypedDictValues(ClassLiteral<'db>),
+}
 
 /// An application of a structural recursive type constructor.
 /// The private body remains unspecialized; `arguments` records this application's
@@ -154,19 +179,19 @@ impl get_size2::GetSize for RecursiveCycle {}
 /// Use the binding operations in this module to construct recursive types.
 #[salsa::interned(debug, constructor=new_internal, heap_size=ruff_memory_usage::heap_size)]
 pub struct RecursiveType<'db> {
-    /// The defining symbol of the implicit alias, including for qualified references.
+    /// The declaration that owns this constructor, including for qualified references.
     #[returns(copy)]
     pub(super) definition: Definition<'db>,
-    /// Names the binder and distinguishes provisional types of different alias queries.
+    /// Distinguishes binders and projections, including provisional types of alias queries.
     #[returns(copy)]
     cycle: RecursiveCycle,
     #[returns(copy)]
-    body: Type<'db>,
+    body: RecursiveBody<'db>,
     /// The actual arguments for this application, which may themselves contain type variables.
     /// They are applied when unfolding; the stored body remains unspecialized.
     #[returns(copy)]
     pub(super) arguments: Option<Specialization<'db>>,
-    /// The lazy materialization applied to this recursive alias, if any.
+    /// The lazy materialization applied to this recursive type, if any.
     #[returns(copy)]
     pub(super) materialization_kind: Option<MaterializationKind>,
 }
@@ -175,7 +200,7 @@ impl get_size2::GetSize for RecursiveType<'_> {}
 
 #[salsa::tracked]
 impl<'db> RecursiveType<'db> {
-    /// Summarize the open constructor body without applying semantic substitutions.
+    /// Summarize the unspecialized constructor without applying semantic substitutions.
     pub(super) fn cycle_summary(self, db: &'db dyn Db) -> &'db AliasCycleSummary<'db> {
         #[salsa::tracked(
             returns(ref),
@@ -187,11 +212,17 @@ impl<'db> RecursiveType<'db> {
             recursive: RecursiveType<'db>,
             (): (),
         ) -> AliasCycleSummary<'db> {
-            let mut summary = AliasCycleSummary::from_type(db, recursive.body(db));
+            let body = match recursive.body(db) {
+                RecursiveBody::Type(body) => body,
+                RecursiveBody::TypedDictValues(class) => {
+                    TypedDictType::new(class.identity_specialization(db)).unfold_value_type(db)
+                }
+            };
+            let mut summary = AliasCycleSummary::from_type(db, body);
             // Nested bodies can refer to an enclosing binder. Close only the cycle marker,
             // so recovery never exposes an unbound variable as a standalone type.
             if let Some(Type::RecursiveVar(variable)) = summary.cycle {
-                summary.cycle = Some(Type::divergent_alias(variable.cycle(db).0));
+                summary.cycle = Some(Type::divergent_alias(variable.cycle(db).id()));
             }
             summary
         }
@@ -206,16 +237,32 @@ impl<'db> RecursiveType<'db> {
         cycle: salsa::Id,
         parameters: Option<GenericContext<'db>>,
     ) -> Self {
-        let cycle = RecursiveCycle(cycle);
+        let cycle = RecursiveCycle::Alias(cycle);
         let arguments = parameters.map(|parameters| parameters.identity_specialization(db));
         Self::new_internal(
             db,
             definition,
             cycle,
-            Type::RecursiveVar(RecursiveVar::new_internal(db, cycle, arguments)),
+            RecursiveBody::Type(Type::RecursiveVar(RecursiveVar::new_internal(
+                db, cycle, arguments,
+            ))),
             arguments,
             None,
         )
+    }
+
+    /// Defer the possible values of a `TypedDict` until a type operation observes them.
+    pub(super) fn typed_dict_values(db: &'db dyn Db, class: ClassType<'db>) -> Option<Self> {
+        let definition = class.definition(db)?;
+        let (origin, arguments) = class.class_literal_and_specialization(db);
+        Some(Self::new_internal(
+            db,
+            definition,
+            RecursiveCycle::TypedDictValues(definition.as_id()),
+            RecursiveBody::TypedDictValues(origin),
+            arguments,
+            None,
+        ))
     }
 
     /// Close recursive occurrences after inferring an alias's constructor expression.
@@ -254,7 +301,7 @@ impl<'db> RecursiveType<'db> {
         );
         // Alias arguments can expose a reference without introducing a container.
         if body.has_unguarded_alias_cycle(db) {
-            Type::divergent_alias(self.cycle(db).0)
+            Type::divergent_alias(self.cycle(db).id())
         } else if body == original {
             // Binding changes a closed type only by introducing references to this binder.
             body
@@ -263,7 +310,7 @@ impl<'db> RecursiveType<'db> {
                 db,
                 self.definition(db),
                 self.cycle(db),
-                body,
+                RecursiveBody::Type(body),
                 self.arguments(db),
                 None,
             ))
@@ -279,6 +326,24 @@ impl<'db> RecursiveType<'db> {
             arguments,
             self.materialization_kind(db),
         )
+    }
+
+    /// Normalize markers from inference cycles in this application without changing its bound body.
+    /// Recursive arguments are outside the binder and can contain results from value inference.
+    pub(super) fn recursive_type_normalized_impl(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        div: Type<'db>,
+        nested: bool,
+    ) -> Option<Self> {
+        let arguments = match self.arguments(db) {
+            Some(arguments) => {
+                Some(arguments.recursive_type_normalized_impl(db, env, div, nested)?)
+            }
+            None => None,
+        };
+        Some(self.with_arguments(db, arguments))
     }
 
     fn with_materialization(
@@ -302,7 +367,7 @@ impl<'db> RecursiveType<'db> {
             .map(|arguments| arguments.generic_context(db))
     }
 
-    /// The declared alias name, shared by all specializations of this constructor.
+    /// The declaration's name, shared by all specializations of this constructor.
     pub(super) fn name(self, db: &'db dyn Db) -> &'db str {
         let definition = self.definition(db);
         // Qualified uses retain the original declaration's symbol, not the access expression.
@@ -312,13 +377,11 @@ impl<'db> RecursiveType<'db> {
     }
 
     /// The source alias's definition and name, if this binder comes from an alias.
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "Keep alias metadata optional for inferred recursive types"
-    )]
     pub(super) fn alias(self, db: &'db dyn Db) -> Option<(Definition<'db>, &'db str)> {
-        // Only implicit alias inference constructs recursive types at present.
-        Some((self.definition(db), self.name(db)))
+        match self.body(db) {
+            RecursiveBody::Type(_) => Some((self.definition(db), self.name(db))),
+            RecursiveBody::TypedDictValues(_) => None,
+        }
     }
 
     /// Restore the formal arguments and remove materialization for constructor analysis.
@@ -374,8 +437,18 @@ impl<'db> RecursiveType<'db> {
         heap_size=ruff_memory_usage::heap_size
     )]
     fn unfolded_body(self, db: &'db dyn Db) -> Type<'db> {
+        let body = match self.body(db) {
+            RecursiveBody::Type(body) => body,
+            RecursiveBody::TypedDictValues(origin) => {
+                let class = origin.apply_specialization(db, |context| {
+                    self.arguments(db)
+                        .unwrap_or_else(|| context.identity_specialization(db))
+                });
+                return TypedDictType::new(class).unfold_value_type(db);
+            }
+        };
         let env = self.environment(db);
-        let unfolded = self.body(db).apply_type_mapping_impl(
+        let unfolded = body.apply_type_mapping_impl(
             db,
             &TypeMapping::ApplyRecursiveSubstitution(RecursiveMapping(
                 RecursiveSubstitution::Unfold(self),
@@ -413,11 +486,11 @@ impl<'db> RecursiveType<'db> {
             }
             TypeMapping::ApplyRecursiveSubstitution(RecursiveMapping(substitution)) => {
                 // This binder shadows the target in its body, but not in its arguments.
-                let body = if self.cycle(db) == substitution.cycle(db) {
-                    self.body(db)
-                } else {
-                    self.body(db)
-                        .apply_type_mapping_impl(db, mapping, tcx, visitor)
+                let body = match self.body(db) {
+                    RecursiveBody::Type(body) if self.cycle(db) != substitution.cycle(db) => {
+                        RecursiveBody::Type(body.apply_type_mapping_impl(db, mapping, tcx, visitor))
+                    }
+                    body => body,
                 };
                 let arguments = self
                     .arguments(db)
