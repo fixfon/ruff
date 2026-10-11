@@ -21,7 +21,7 @@ use ty_module_resolver::{
 use ty_python_core::{ProgramFile, semantic_index};
 use ty_python_semantic::HasType;
 use ty_python_semantic::importer::{ImportRequest, Importer};
-use ty_python_semantic::types::{SpecialFormType, UnionType};
+use ty_python_semantic::types::{ApplyTypeMappingVisitor, SpecialFormType, UnionType};
 use ty_python_semantic::{
     Completion as SemanticCompletion, NameKind, SemanticModel,
     types::{CycleDetector, KnownClass, Type},
@@ -3357,7 +3357,12 @@ fn completion_kind_from_type<'db>(db: &'db dyn Db, ty: Type<'db>) -> Option<Comp
             Type::Recursive(recursive) => visitor.visit(db, ty, || {
                 imp(
                     db,
-                    recursive.unfold(db, &recursive.environment(db)).into_type(),
+                    recursive
+                        .unfold(
+                            db,
+                            &ApplyTypeMappingVisitor::new(&recursive.environment(db)),
+                        )
+                        .into_type(),
                     visitor,
                 )
             })?,

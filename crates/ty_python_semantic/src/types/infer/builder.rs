@@ -126,14 +126,15 @@ use crate::types::unpacker::{
     tuple_literal_needs_promotion,
 };
 use crate::types::{
-    BindingContext, BoundTypeVarInstance, CallDunderError, CallableBinding, CallableType,
-    ClassType, DynamicType, GeneratorTypeMode, InferenceFlags, InternedConstraintSet, InternedType,
-    IntersectionBuilder, IntersectionType, KnownBoundMethodType, KnownClass, KnownInstanceType,
-    KnownUnion, LiteralValueType, LiteralValueTypeKind, MemberLookupPolicy, ParamSpecAttrKind,
-    Parameter, Parameters, ProgramEnvironment, PropertyDeprecations, SentinelInstance, Signature,
-    SpecialFormType, SubclassOfType, Type, TypeAliasType, TypeAndQualifiers, TypeContext,
-    TypeQualifiers, TypeVarBoundOrConstraints, TypeVarKind, TypeVarVariance, TypingModule,
-    UnionAccumulator, UnionBuilder, UnionType, any_over_type, binding_type,
+    ApplyTypeMappingVisitor, BindingContext, BoundTypeVarInstance, CallDunderError,
+    CallableBinding, CallableType, ClassType, DynamicType, GeneratorTypeMode, InferenceFlags,
+    InternedConstraintSet, InternedType, IntersectionBuilder, IntersectionType,
+    KnownBoundMethodType, KnownClass, KnownInstanceType, KnownUnion, LiteralValueType,
+    LiteralValueTypeKind, MemberLookupPolicy, ParamSpecAttrKind, Parameter, Parameters,
+    ProgramEnvironment, PropertyDeprecations, SentinelInstance, Signature, SpecialFormType,
+    SubclassOfType, Type, TypeAliasType, TypeAndQualifiers, TypeContext, TypeQualifiers,
+    TypeVarBoundOrConstraints, TypeVarKind, TypeVarVariance, TypingModule, UnionAccumulator,
+    UnionBuilder, UnionType, any_over_type, binding_type,
     extract_fixed_length_iterable_element_types, infer_complete_scope_types, infer_scope_types,
     is_discarded_dict_key_assignment, todo_type,
 };
@@ -3096,9 +3097,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let db = self.db();
 
         match object_ty {
-            Type::Recursive(recursive) => recursive.unfold(db, env).is_unchanged_or(|unfolded| {
-                self.validate_attribute_deletion(target, unfolded, attribute, emit_diagnostics)
-            }),
+            Type::Recursive(recursive) => recursive
+                .unfold(db, &ApplyTypeMappingVisitor::new(env))
+                .is_unchanged_or(|unfolded| {
+                    self.validate_attribute_deletion(target, unfolded, attribute, emit_diagnostics)
+                }),
             Type::RecursiveVar(_) => {
                 unreachable!("semantic operation on an unbound recursive variable")
             }
@@ -5558,7 +5561,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         ) -> Option<Type<'d>> {
             match ty {
                 Type::Recursive(recursive) => {
-                    let unfolded = recursive.unfold(db, env).into_unfolded()?;
+                    let unfolded = recursive
+                        .unfold(db, &ApplyTypeMappingVisitor::new(env))
+                        .into_unfolded()?;
                     propagate_callable_kind(db, env, unfolded, kind)
                 }
                 Type::RecursiveVar(_) => {

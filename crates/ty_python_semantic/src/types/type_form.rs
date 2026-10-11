@@ -2,6 +2,7 @@ use super::variance::{VarianceInferable, VarianceTerm};
 use super::{BoundTypeVarIdentity, CycleDetector, IntersectionType, Type, UnionType, visitor};
 use crate::Db;
 use crate::ProgramEnvironment;
+use crate::types::ApplyTypeMappingVisitor;
 
 #[salsa::interned(debug, heap_size=ruff_memory_usage::heap_size)]
 pub struct TypeFormType<'db> {
@@ -56,7 +57,14 @@ impl<'db> Type<'db> {
                 }
                 // Recursive bodies can contain type forms; unfold them under the same guard.
                 Type::Recursive(recursive) => visitor.visit(db, ty, || {
-                    project(db, env, recursive.unfold(db, env).into_type(), visitor)
+                    project(
+                        db,
+                        env,
+                        recursive
+                            .unfold(db, &ApplyTypeMappingVisitor::new(env))
+                            .into_type(),
+                        visitor,
+                    )
                 }),
                 Type::Union(union) => {
                     let mut elements = union

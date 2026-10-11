@@ -2,6 +2,7 @@
 
 use crate::Db;
 use crate::ProgramEnvironment;
+use crate::types::ApplyTypeMappingVisitor;
 use std::fmt::{self, Display};
 
 use compact_str::{CompactString, ToCompactString};
@@ -582,14 +583,14 @@ impl<'db> Type<'db> {
 
             (Type::Recursive(recursive), _) => Some(
                 recursive
-                    .unfold(db, env)
+                    .unfold(db, &ApplyTypeMappingVisitor::new(env))
                     .map(|unfolded| unfolded.subscript(db, env, slice_ty, expr_context))
                     .unwrap_or(Ok(value_ty)),
             ),
 
             (_, Type::Recursive(recursive)) => Some(
                 recursive
-                    .unfold(db, env)
+                    .unfold(db, &ApplyTypeMappingVisitor::new(env))
                     .map(|unfolded| value_ty.subscript(db, env, unfolded, expr_context))
                     .unwrap_or(Ok(value_ty)),
             ),
@@ -608,13 +609,16 @@ impl<'db> Type<'db> {
             // Expand overlapping alternatives before collecting their subscript errors.
             (Type::Union(union), _) if union.has_aliases(db) => Some(
                 union
-                    .expand_aliases(db, env)
+                    .expand_aliases(db, &ApplyTypeMappingVisitor::new(env))
                     .subscript(db, env, slice_ty, expr_context),
             ),
 
-            (_, Type::Union(union)) if union.has_aliases(db) => {
-                Some(value_ty.subscript(db, env, union.expand_aliases(db, env), expr_context))
-            }
+            (_, Type::Union(union)) if union.has_aliases(db) => Some(value_ty.subscript(
+                db,
+                env,
+                union.expand_aliases(db, &ApplyTypeMappingVisitor::new(env)),
+                expr_context,
+            )),
 
             (Type::Union(union), _) => Some(map_subscript_alternatives(
                 db,

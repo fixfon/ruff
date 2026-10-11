@@ -9239,6 +9239,24 @@ def update(value: Recursive) -> None:
     value.update({"child": value})
 ```
 
+### Recursive extra-item value types
+
+The extra-item type can refer to all values of the same TypedDict, including a declared field of
+type `Any`. We accept this declaration even though those values include the extra-item type itself:
+
+```py
+from typing import Any, cast
+from typing_extensions import ReadOnly, TypedDict
+from ty_extensions._internal import TypeOf
+
+class Node(
+    TypedDict,
+    # no diagnostic
+    extra_items=ReadOnly[TypeOf[next(iter(cast("Node", {}).values()))]],
+):
+    value: Any
+```
+
 [closed]: https://peps.python.org/pep-0728/#disallowing-extra-items-explicitly
 [subtyping section]: https://typing.python.org/en/latest/spec/typeddict.html#subtyping-between-typeddict-types
 [`typeddict`]: https://typing.python.org/en/latest/spec/typeddict.html

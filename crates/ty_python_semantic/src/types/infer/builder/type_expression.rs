@@ -34,11 +34,11 @@ use ty_python_core::place_table;
 use ty_python_core::scope::ScopeKind;
 
 use crate::types::{
-    BindingContext, CallableType, DynamicType, GenericContext, IntersectionBuilder,
-    IntersectionType, InvalidTypeExpression, KnownClass, KnownInstanceType, LintDiagnosticGuard,
-    Parameter, Parameters, SpecialFormType, SubclassOfType, Type, TypeContext, TypeFormType,
-    TypeGuardType, TypeIsType, TypeMapping, TypeVarKind, UnionBuilder, UnionType, any_over_type,
-    binding_type, todo_type,
+    ApplyTypeMappingVisitor, BindingContext, CallableType, DynamicType, GenericContext,
+    IntersectionBuilder, IntersectionType, InvalidTypeExpression, KnownClass, KnownInstanceType,
+    LintDiagnosticGuard, Parameter, Parameters, SpecialFormType, SubclassOfType, Type, TypeContext,
+    TypeFormType, TypeGuardType, TypeIsType, TypeMapping, TypeVarKind, UnionBuilder, UnionType,
+    any_over_type, binding_type, todo_type,
 };
 use crate::{FxOrderSet, SemanticModel, add_inferred_python_version_hint_to_diagnostic};
 
@@ -1596,7 +1596,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             let slice_ty = slice_ty.resolve_type_alias(db);
             let slice_ty = match slice_ty {
                 Type::Union(union) if union.has_aliases(builder.db()) => {
-                    union.expand_aliases(db, env)
+                    union.expand_aliases(db, &ApplyTypeMappingVisitor::new(env))
                 }
                 _ => slice_ty,
             };

@@ -8,6 +8,7 @@
 //! relation and constraint set.
 
 use crate::Db;
+use crate::types::ApplyTypeMappingVisitor;
 use ty_module_resolver::KnownModule;
 use ty_python_core::{definition::Definition, use_def_map};
 
@@ -319,7 +320,7 @@ pub(super) fn attribute_write_requirement<'db>(
             attribute_write_requirement(db, env, alias.value_type(db), attribute)
         }
         Type::Recursive(recursive) => recursive
-            .unfold(db, env)
+            .unfold(db, &ApplyTypeMappingVisitor::new(env))
             .map(|unfolded| attribute_write_requirement(db, env, unfolded, attribute))
             .unwrap_or(AttributeWriteRequirement::Unconstrained),
 

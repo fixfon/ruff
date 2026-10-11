@@ -72,12 +72,13 @@ use crate::types::visitor::{
     walk_type_with_recursion_guard,
 };
 use crate::types::{
-    BindingContext, BoundTypeVarInstance, CallableType, CallableTypes, ClassLiteral, CycleDetector,
-    DATACLASS_FLAGS, DataclassFlags, DataclassParams, DynamicType, GenericAlias,
-    InternedConstraintSet, IntersectionType, KnownBoundMethodType, KnownClass, KnownInstanceType,
-    LiteralValueTypeKind, NominalInstanceType, PropertyInstanceType, TypeContext, TypeIdentity,
-    TypeMapping, TypeVarBoundOrConstraints, TypeVarVariance, UnionAccumulator, UnionBuilder,
-    UnionType, WrapperDescriptorKind, enums, is_property_method, list_members,
+    ApplyTypeMappingVisitor, BindingContext, BoundTypeVarInstance, CallableType, CallableTypes,
+    ClassLiteral, CycleDetector, DATACLASS_FLAGS, DataclassFlags, DataclassParams, DynamicType,
+    GenericAlias, InternedConstraintSet, IntersectionType, KnownBoundMethodType, KnownClass,
+    KnownInstanceType, LiteralValueTypeKind, NominalInstanceType, PropertyInstanceType,
+    TypeContext, TypeIdentity, TypeMapping, TypeVarBoundOrConstraints, TypeVarVariance,
+    UnionAccumulator, UnionBuilder, UnionType, WrapperDescriptorKind, enums, is_property_method,
+    list_members,
 };
 use crate::{DisplaySettings, FxOrderSet};
 use ruff_db::diagnostic::{Annotation, Diagnostic, Span, SubDiagnostic, SubDiagnosticSeverity};
@@ -10470,7 +10471,9 @@ impl<'db> ClassInfoValidator<'_, 'db> {
             Type::SpecialForm(special) if special.is_valid_isinstance_target() => true,
             Type::Union(union) => union.elements(db).iter().copied().all(validate),
             Type::TypeAlias(alias) => validate(alias.value_type(db)),
-            Type::Recursive(recursive) => recursive.unfold(db, self.env).is_unfolded_and(validate),
+            Type::Recursive(recursive) => recursive
+                .unfold(db, &ApplyTypeMappingVisitor::new(self.env))
+                .is_unfolded_and(validate),
             _ => {
                 if let Some(tuple) = ty.tuple_instance_spec(db, self.env) {
                     tuple.iter_element_types(db).all(validate)

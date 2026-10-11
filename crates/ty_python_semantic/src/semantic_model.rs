@@ -29,9 +29,9 @@ use crate::place_load::{
 use crate::types::ide_support::{ImportAliasResolution, definition_for_name};
 use crate::types::list_members::{all_members, all_reachable_members};
 use crate::types::{
-    CycleDetector, ProgramEnvironment, SpecialFormType, Type, TypeQualifiers, binding_type,
-    infer_complete_scope_types, infer_definition_types, inferred_declaration,
-    is_discarded_dict_key_assignment,
+    ApplyTypeMappingVisitor, CycleDetector, ProgramEnvironment, SpecialFormType, Type,
+    TypeQualifiers, binding_type, infer_complete_scope_types, infer_definition_types,
+    inferred_declaration, is_discarded_dict_key_assignment,
 };
 use ty_python_core::definition::{Definition, DefinitionKind};
 use ty_python_core::place::PlaceExpr;
@@ -690,7 +690,10 @@ impl<'db> SemanticModel<'db> {
                 }
                 Type::Recursive(recursive) => visitor.visit(db, ty, || {
                     recursive
-                        .unfold(db, &recursive.environment(db))
+                        .unfold(
+                            db,
+                            &ApplyTypeMappingVisitor::new(&recursive.environment(db)),
+                        )
                         .map(|unfolded| collect(db, unfolded, visitor))
                         .unwrap_or_else(Vec::new)
                 }),

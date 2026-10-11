@@ -5,6 +5,7 @@
 //! listing all members on a nominal-instance type or a class-literal type requires
 //! listing all members in the class's body scope.
 
+use crate::types::ApplyTypeMappingVisitor;
 use std::cmp::Ordering;
 
 use itertools::Itertools;
@@ -339,7 +340,9 @@ impl<'db> AllMembers<'db> {
             }
 
             Type::Recursive(recursive) => {
-                let unfolded = recursive.unfold(db, env).unwrap_or_else(Type::object);
+                let unfolded = recursive
+                    .unfold(db, &ApplyTypeMappingVisitor::new(env))
+                    .unwrap_or_else(Type::object);
                 self.extend_with_type(db, env, unfolded);
             }
 

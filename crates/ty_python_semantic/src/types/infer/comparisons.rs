@@ -19,10 +19,10 @@ use crate::types::iteration::extract_literal_container_element_types;
 use crate::types::known_instance::{FunctoolsPartialInstance, InternedType, MethodWrapper};
 use crate::types::tuple::{Tuple, TupleSpec};
 use crate::types::{
-    BoundMethodType, CallableType, DynamicType, FunctionType, IntersectionBuilder,
-    IntersectionType, KnownBoundMethodType, KnownClass, KnownInstanceType, LiteralValueType,
-    LiteralValueTypeKind, MemberLookupPolicy, PropertyInstanceType, Type, TypeContext,
-    TypeTransformer, TypeVarBoundOrConstraints, UnionBuilder,
+    ApplyTypeMappingVisitor, BoundMethodType, CallableType, DynamicType, FunctionType,
+    IntersectionBuilder, IntersectionType, KnownBoundMethodType, KnownClass, KnownInstanceType,
+    LiteralValueType, LiteralValueTypeKind, MemberLookupPolicy, PropertyInstanceType, Type,
+    TypeContext, TypeTransformer, TypeVarBoundOrConstraints, UnionBuilder,
 };
 use ty_python_core::Truthiness;
 
@@ -315,7 +315,7 @@ impl<'db> Type<'db> {
             match ty {
                 Type::Recursive(recursive) => visit_type(db, ty, visitor, || {
                     recursive
-                        .unfold(db, env)
+                        .unfold(db, &ApplyTypeMappingVisitor::new(env))
                         .map(|unfolded| upcast(db, env, unfolded, visitor))
                         .unwrap_or(UpcastResult::unstable(ty))
                 }),

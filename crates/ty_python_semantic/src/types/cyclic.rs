@@ -36,8 +36,8 @@ use crate::types::function::FunctionLiteral;
 use crate::types::generics::{GenericContext, Specialization};
 use crate::types::visitor::{TypeCollector, TypeVisitor, walk_type_with_recursion_guard};
 use crate::types::{
-    BoundTypeVarIdentity, BoundTypeVarInstance, ProtocolInstanceType, RecursiveType,
-    StaticClassLiteral, Type, TypeAliasType, TypedDictType,
+    ApplyTypeMappingVisitor, BoundTypeVarIdentity, BoundTypeVarInstance, ProtocolInstanceType,
+    RecursiveType, StaticClassLiteral, Type, TypeAliasType, TypedDictType,
 };
 use crate::{Db, ProgramEnvironment};
 
@@ -589,7 +589,10 @@ impl<'db> SpecializationFlowVisitor<'db> {
     fn visit_definition_body(&self, db: &'db dyn Db, source: RecursiveDefinition<'db>) -> bool {
         match source {
             RecursiveDefinition::Structural(recursive) => {
-                let Some(body) = recursive.unfold(db, &self.env).into_unfolded() else {
+                let Some(body) = recursive
+                    .unfold(db, &ApplyTypeMappingVisitor::new(&self.env))
+                    .into_unfolded()
+                else {
                     return false;
                 };
                 self.visit_type(db, body);

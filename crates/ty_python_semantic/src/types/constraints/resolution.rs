@@ -13,8 +13,8 @@ use crate::types::signatures::{Signature, walk_signature};
 use crate::types::typevar::{BoundTypeVarIdentity, TypeVarSet};
 use crate::types::visitor::{TypeKind, TypeVisitor, walk_non_atomic_type};
 use crate::types::{
-    BoundTypeVarInstance, CallableType, KnownInstanceType, RecursiveType, Type, TypeAliasType,
-    TypeContext, TypeMapping,
+    ApplyTypeMappingVisitor, BoundTypeVarInstance, CallableType, KnownInstanceType, RecursiveType,
+    Type, TypeAliasType, TypeContext, TypeMapping,
 };
 use crate::{Db, FxOrderMap, ProgramEnvironment};
 
@@ -209,7 +209,12 @@ impl<'db> TypeVisitor<'db> for Dependencies<'_, 'db> {
     }
 
     fn visit_recursive_type(&self, db: &'db dyn Db, recursive: RecursiveType<'db>) {
-        self.visit_type(db, recursive.unfold(db, self.env).into_type());
+        self.visit_type(
+            db,
+            recursive
+                .unfold(db, &ApplyTypeMappingVisitor::new(self.env))
+                .into_type(),
+        );
     }
 
     fn visit_function_type(&self, db: &'db dyn Db, function: FunctionType<'db>) {

@@ -34,11 +34,11 @@ use crate::types::type_alias::QualifiedTypeAliasName;
 use crate::types::typevar::BoundTypeVarIdentity;
 use crate::types::visitor::TypeVisitor;
 use crate::types::{
-    CallableType, IntersectionType, KnownBoundMethodType, KnownClass, KnownInstanceType,
-    KnownUnion, LiteralValueType, LiteralValueTypeKind, MaterializationKind, PropertyInstanceClass,
-    PropertyInstanceType, Protocol, SpecialFormType, SubclassOfInner, SubclassOfType, Type,
-    TypeAliasType, TypeGuardLike, TypedDictType, TypingModule, UnionBuilder, UnionType,
-    WrapperDescriptorKind, visitor,
+    ApplyTypeMappingVisitor, CallableType, IntersectionType, KnownBoundMethodType, KnownClass,
+    KnownInstanceType, KnownUnion, LiteralValueType, LiteralValueTypeKind, MaterializationKind,
+    PropertyInstanceClass, PropertyInstanceType, Protocol, SpecialFormType, SubclassOfInner,
+    SubclassOfType, Type, TypeAliasType, TypeGuardLike, TypedDictType, TypingModule, UnionBuilder,
+    UnionType, WrapperDescriptorKind, visitor,
 };
 use ty_python_core::ProgramFile;
 use ty_python_core::definition::Definition;
@@ -723,7 +723,10 @@ impl<'db> TypeVisitor<'db> for AmbiguousNameCollector<'_, 'db> {
                 &Type::Recursive(recursive).to_type_identity(db),
                 || (),
                 || {
-                    if let Some(unfolded) = recursive.unfold(db, self.env).into_unfolded() {
+                    if let Some(unfolded) = recursive
+                        .unfold(db, &ApplyTypeMappingVisitor::new(self.env))
+                        .into_unfolded()
+                    {
                         self.visit_type(db, unfolded);
                     }
                 },
@@ -1004,7 +1007,9 @@ impl<'db> Type<'db> {
                     definition,
                     name,
                     constructor.parameters(db),
-                    constructor.unfold(db, env).into_type(),
+                    constructor
+                        .unfold(db, &ApplyTypeMappingVisitor::new(env))
+                        .into_type(),
                 )
             }
             _ => return None,

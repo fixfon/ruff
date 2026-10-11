@@ -5,10 +5,11 @@ use ruff_db::diagnostic::{Annotation, SubDiagnostic, SubDiagnosticSeverity};
 use ruff_text_size::{Ranged, TextRange};
 
 use crate::types::{
-    CallArguments, CallDunderError, ClassType, CycleDetector, KnownClass, KnownInstanceType,
-    LiteralValueTypeKind, PropertyInstanceClass, SubclassOfInner, Type, TypeContext,
-    TypeVarBoundOrConstraints, UnionType, call::CallErrorKind, constraints::ConstraintSetBuilder,
-    context::InferContext, diagnostic::UNSUPPORTED_BOOL_CONVERSION, typed_dict::TypedDictField,
+    ApplyTypeMappingVisitor, CallArguments, CallDunderError, ClassType, CycleDetector, KnownClass,
+    KnownInstanceType, LiteralValueTypeKind, PropertyInstanceClass, SubclassOfInner, Type,
+    TypeContext, TypeVarBoundOrConstraints, UnionType, call::CallErrorKind,
+    constraints::ConstraintSetBuilder, context::InferContext,
+    diagnostic::UNSUPPORTED_BOOL_CONVERSION, typed_dict::TypedDictField,
 };
 use ty_python_core::Truthiness;
 
@@ -240,7 +241,7 @@ impl<'db> Type<'db> {
             Type::Never => Truthiness::Uninhabited,
 
             Type::Recursive(recursive) => recursive
-                .unfold(db, env)
+                .unfold(db, &ApplyTypeMappingVisitor::new(env))
                 .map(|unfolded| unfolded.try_bool_impl(db, env, allow_short_circuit, visitor))
                 .unwrap_or(Ok(Truthiness::Ambiguous))?,
 

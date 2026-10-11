@@ -603,6 +603,14 @@ class Right[T](TypedDict, closed=True):
     value: TypeOf[next(iter(cast("Left[T]", {}).values()))]
 ```
 
+No concrete value type can be inferred for the recursive field. Attribute access is therefore
+allowed:
+
+```py
+def check(left: Left[int]):
+    left["value"].missing  # no diagnostic
+```
+
 ## Mutually recursive TypedDict values inside tuples
 
 The values returned by `Right.values()` can contain the recursive reference inside a tuple. We still
@@ -641,6 +649,46 @@ class Right[T](TypedDict, closed=True):
 
 def check(left: Left[str]):
     reveal_type(left["value"])  # revealed: int
+```
+
+## Iterating recursive TypedDict values with `Any`
+
+The recursive field contains lists of values from another specialization of `Node`. We can iterate
+over the values even when the type argument is `Any`:
+
+```py
+from typing import Any, cast
+from typing_extensions import TypedDict
+from ty_extensions._internal import TypeOf
+
+class Node[T](TypedDict, closed=True):
+    leaf: T
+    value: list[TypeOf[next(iter(cast("Node[list[T]]", {}).values()))]]
+
+def check(node: Node[Any]):
+    iter(node.values())  # no diagnostic
+```
+
+## Iterating mutually recursive TypedDict values with `Any`
+
+Iteration also works when the recursive references pass through two TypedDicts. Here a value from
+`Left[Any]` can be a list containing values from another specialization of `Left`:
+
+```py
+from typing import Any, cast
+from typing_extensions import TypedDict
+from ty_extensions._internal import TypeOf
+
+class Left[T](TypedDict, closed=True):
+    leaf: T
+    value: TypeOf[next(iter(cast("Right[list[T]]", {}).values()))]
+
+class Right[T](TypedDict, closed=True):
+    leaf: T
+    value: list[TypeOf[next(iter(cast("Left[T]", {}).values()))]]
+
+def check(node: Left[Any]):
+    iter(node.values())  # no diagnostic
 ```
 
 ## Diagnostics for bad specializations

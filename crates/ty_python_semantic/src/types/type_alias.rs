@@ -152,7 +152,16 @@ impl<'db> AliasCycleRecovery<'_, 'db> {
                 self.recover(db, value)
             }),
             Type::Recursive(recursive) => self.visitor.visit(db, ty, || {
-                self.recover(db, recursive.unfold(db, self.env).into_unfolded()?)
+                self.recover(
+                    db,
+                    recursive
+                        .unfold(
+                            db,
+                            &ApplyTypeMappingVisitor::new(self.env)
+                                .with_recursion_context(self.context),
+                        )
+                        .into_unfolded()?,
+                )
             }),
             Type::Union(union) => {
                 let elements: Vec<_> = union

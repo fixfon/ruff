@@ -155,7 +155,9 @@ impl<'db> ClassBase<'db> {
             Type::Dynamic(dynamic) => Some(Self::Dynamic(dynamic)),
             Type::Divergent(divergent) => Some(Self::Divergent(divergent)),
             Type::Recursive(recursive) => {
-                let unfolded = recursive.unfold(db, env).into_unfolded()?;
+                let unfolded = recursive
+                    .unfold(db, &ApplyTypeMappingVisitor::new(env))
+                    .into_unfolded()?;
                 Self::try_from_type(db, env, unfolded, subclass)
             }
             Type::ClassLiteral(literal) => Some(Self::Class(literal.default_specialization(db))),

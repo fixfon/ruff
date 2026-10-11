@@ -1,9 +1,9 @@
 use crate::Db;
 use crate::ProgramEnvironment;
 use crate::types::{
-    AwaitError, Bindings, CallArguments, CallDunderError, KnownClass, LintDiagnosticGuard,
-    LintDiagnosticGuardBuilder, LiteralValueTypeKind, Type, TypeContext, TypeVarBoundOrConstraints,
-    UnionType,
+    ApplyTypeMappingVisitor, AwaitError, Bindings, CallArguments, CallDunderError, KnownClass,
+    LintDiagnosticGuard, LintDiagnosticGuardBuilder, LiteralValueTypeKind, Type, TypeContext,
+    TypeVarBoundOrConstraints, UnionType,
     call::CallErrorKind,
     context::InferContext,
     diagnostic::NOT_ITERABLE,
@@ -307,9 +307,13 @@ impl<'db> Type<'db> {
                     Some(Cow::Owned(TupleSpec::homogeneous(Type::unknown())))
                 }
                 Type::TypeAlias(alias) => non_async_special_case(db, env, alias.value_type(db)),
-                Type::Recursive(recursive) => {
-                    non_async_special_case(db, env, recursive.unfold(db, env).into_unfolded()?)
-                }
+                Type::Recursive(recursive) => non_async_special_case(
+                    db,
+                    env,
+                    recursive
+                        .unfold(db, &ApplyTypeMappingVisitor::new(env))
+                        .into_unfolded()?,
+                ),
                 Type::TypeVar(tvar) => match tvar.typevar(db).bound_or_constraints(db, env)? {
                     TypeVarBoundOrConstraints::UpperBound(bound) => {
                         non_async_special_case(db, env, bound)

@@ -17,14 +17,14 @@ use crate::types::tuple::{TupleElement, TupleLength, TupleSpec, TupleSpecBuilder
 use crate::types::typed_dict::{TypedDictFieldBuilder, TypedDictSchema, TypedDictType};
 use crate::types::unpacker::collected_list_type;
 use crate::types::{
-    CallableType, ClassBase, ClassLiteral, ClassPatternPositionalSource, ClassType, CycleDetector,
-    IntersectionBuilder, IntersectionType, KnownClass, KnownInstanceType, LiteralValueTypeKind,
-    Parameter, Parameters, Signature, SpecialFormType, SubclassOfInner, SubclassOfType, Truthiness,
-    Type, TypeContext, TypeVarBoundOrConstraints, UnfoldResult, UnionBuilder, binding_type,
-    class_pattern_positional_sources, definite_match_pattern_type_for_subject,
-    exact_sequence_pattern_type, infer_expression_types, mapping_pattern_type,
-    pattern_binding_fallthrough_type, sequence_pattern_type_builder, singleton_pattern_type,
-    starred_sequence_pattern_type, typed_dict_matches_class_pattern,
+    ApplyTypeMappingVisitor, CallableType, ClassBase, ClassLiteral, ClassPatternPositionalSource,
+    ClassType, CycleDetector, IntersectionBuilder, IntersectionType, KnownClass, KnownInstanceType,
+    LiteralValueTypeKind, Parameter, Parameters, Signature, SpecialFormType, SubclassOfInner,
+    SubclassOfType, Truthiness, Type, TypeContext, TypeVarBoundOrConstraints, UnfoldResult,
+    UnionBuilder, binding_type, class_pattern_positional_sources,
+    definite_match_pattern_type_for_subject, exact_sequence_pattern_type, infer_expression_types,
+    mapping_pattern_type, pattern_binding_fallthrough_type, sequence_pattern_type_builder,
+    singleton_pattern_type, starred_sequence_pattern_type, typed_dict_matches_class_pattern,
 };
 use crate::{Db, ProgramEnvironment};
 use ty_python_core::ast_ids::HasScopedUseId;
@@ -591,9 +591,12 @@ impl<'db> ClassInfoConstraint<'_, 'db> {
                 unreachable!("semantic operation on an unbound recursive variable")
             }
             Type::TypeAlias(alias) => self.generate(db, alias.value_type(db)),
-            Type::Recursive(recursive) => {
-                self.generate(db, recursive.unfold(db, env).into_unfolded()?)
-            }
+            Type::Recursive(recursive) => self.generate(
+                db,
+                recursive
+                    .unfold(db, &ApplyTypeMappingVisitor::new(env))
+                    .into_unfolded()?,
+            ),
             Type::ClassLiteral(class_literal) => Some(constraint_from_class_literal(class_literal)),
             Type::SubclassOf(subclass_of_ty) => {
                 // We can't narrow negatively from a `SubclassOf` type. `if !isinstance(x, y)`
@@ -5493,7 +5496,10 @@ fn is_or_contains_typeddict<'db>(db: &'db dyn Db, ty: Type<'db>) -> bool {
             .any(|union_member_ty| is_or_contains_typeddict(db, *union_member_ty)),
         Type::TypeAlias(alias) => is_or_contains_typeddict(db, alias.value_type(db)),
         Type::Recursive(recursive) => recursive
-            .unfold(db, &recursive.environment(db))
+            .unfold(
+                db,
+                &ApplyTypeMappingVisitor::new(&recursive.environment(db)),
+            )
             .is_unfolded_and(|unfolded| is_or_contains_typeddict(db, unfolded)),
 
         Type::Dynamic(_)
@@ -5639,7 +5645,9 @@ fn visit_matching_typeddict_field_types<'db>(
             );
         }
         Type::Recursive(recursive) => {
-            if let UnfoldResult::Unfolded(unfolded) = recursive.unfold(db, env) {
+            if let UnfoldResult::Unfolded(unfolded) =
+                recursive.unfold(db, &ApplyTypeMappingVisitor::new(env))
+            {
                 visit_matching_typeddict_field_types(db, env, unfolded, field_name, visit);
             }
             return;

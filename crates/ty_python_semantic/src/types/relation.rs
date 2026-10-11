@@ -1843,7 +1843,7 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
                     };
                     by_arguments.or(db, self.constraints, || {
                         source_recursive
-                            .unfold(db, self.env)
+                            .unfold(db, self.materialization_visitor)
                             .map(|source_unfolded| {
                                 self.check_type_pair(db, source_unfolded, target)
                             })
@@ -1858,7 +1858,7 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
             (_, Type::Recursive(target_recursive)) => {
                 self.with_recursion_guard(db, source, target, || {
                     target_recursive
-                        .unfold(db, self.env)
+                        .unfold(db, self.materialization_visitor)
                         .map(|target_unfolded| self.check_type_pair(db, source, target_unfolded))
                         .unwrap_or(ConstraintSet::from_bool(
                             self.constraints,
@@ -1892,7 +1892,11 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
             // that depend on multiple elements, such as all members of an enum, are visible.
             (_, Type::Union(union)) if union.has_aliases(db) => {
                 self.with_recursion_guard(db, source, target, || {
-                    self.check_type_pair(db, source, union.expand_aliases(db, env))
+                    self.check_type_pair(
+                        db,
+                        source,
+                        union.expand_aliases(db, self.materialization_visitor),
+                    )
                 })
             }
 
@@ -3455,7 +3459,7 @@ impl<'a, 'c, 'db> DisjointnessChecker<'a, 'c, 'db> {
             (Type::Divergent(_), _) | (_, Type::Divergent(_)) => self.never(),
 
             (Type::Recursive(left_recursive), _) => left_recursive
-                .unfold(db, env)
+                .unfold(db, self.materialization_visitor)
                 .map(|left_unfolded| {
                     self.with_recursion_guard(db, left, right, || {
                         self.check_type_pair(db, left_unfolded, right)
@@ -3464,7 +3468,7 @@ impl<'a, 'c, 'db> DisjointnessChecker<'a, 'c, 'db> {
                 .unwrap_or(self.never()),
 
             (_, Type::Recursive(right_recursive)) => right_recursive
-                .unfold(db, env)
+                .unfold(db, self.materialization_visitor)
                 .map(|right_unfolded| {
                     self.with_recursion_guard(db, left, right, || {
                         self.check_type_pair(db, left, right_unfolded)

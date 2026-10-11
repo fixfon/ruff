@@ -1,6 +1,7 @@
 //! Logic for inferring `super()`, `super(x)` and `super(x, y)` calls.
 
 use crate::ProgramEnvironment;
+use crate::types::ApplyTypeMappingVisitor;
 use itertools::{Either, Itertools};
 use ruff_db::diagnostic::Diagnostic;
 use ruff_python_ast::{AnyNodeRef, name::Name};
@@ -651,13 +652,14 @@ impl<'db> BoundSuperType<'db> {
             Type::Dynamic(dynamic) => SuperOwnerKind::Dynamic(dynamic),
             Type::Divergent(divergent) => SuperOwnerKind::Divergent(divergent),
             Type::Recursive(recursive) => {
-                return recursive.unfold(db, env).map(delegate_to).unwrap_or(Err(
-                    BoundSuperError::AbstractOwnerType {
+                return recursive
+                    .unfold(db, &ApplyTypeMappingVisitor::new(env))
+                    .map(delegate_to)
+                    .unwrap_or(Err(BoundSuperError::AbstractOwnerType {
                         owner_type,
                         pivot_class: pivot_class_type,
                         typevar_context: None,
-                    },
-                ));
+                    }));
             }
             Type::ClassLiteral(class) => SuperOwnerKind::Resolved(Self::resolve_class_super_owner(
                 db,

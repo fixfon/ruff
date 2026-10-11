@@ -14,7 +14,7 @@ use crate::types::{
     TypeMapping, TypePair, TypeQualifiers,
 };
 use crate::types::{TypeVarBoundOrConstraints, visitor};
-use crate::{Db, FxOrderSet, Program};
+use crate::{Db, FxOrderSet};
 
 pub(crate) mod builder;
 mod generic_gradual_intersections;
@@ -167,36 +167,39 @@ impl<'db> UnionType<'db> {
     pub(crate) fn expand_aliases(
         self,
         db: &'db dyn Db,
-        env: &ProgramEnvironment<'db>,
+        visitor: &ApplyTypeMappingVisitor<'_, 'db>,
     ) -> Type<'db> {
-        // Relation checks expand the same target union for many different source types.
-        self.cached_expand_aliases(db, env.program(db))
-    }
-
-    #[salsa::tracked(
-        returns(copy),
-        cycle_initial=|_, id, _, _| Type::divergent(id),
-        cycle_fn=|db, cycle, previous: &Type<'db>, result: Type<'db>, _, program| {
-            result.cycle_normalized(db, &ProgramEnvironment::from_program(program), *previous, cycle)
-        },
-        heap_size=ruff_memory_usage::heap_size
-    )]
-    fn cached_expand_aliases(self, db: &'db dyn Db, program: Program<'db>) -> Type<'db> {
-        let env = &ProgramEnvironment::from_program(program);
+        // A relation can compare many source types with this union. Reuse its expansion within
+        // the same materialization root, whose active guards can affect recursive unfoldings.
+        if let Some(expanded) = visitor.expanded_unions.borrow().get(&self) {
+            return *expanded;
+        }
         // Expose both alias forms without expanding aliases inside containers during reduction.
-        let mut builder = UnionBuilder::new(db, env).unpack_aliases(false);
+        let mut builder = UnionBuilder::new(db, visitor.env).unpack_aliases(false);
         let mut pending = vec![Type::Union(self)];
         let mut seen = FxHashSet::default();
         while let Some(element) = pending.pop() {
             if !seen.insert(element) {
                 continue;
             }
-            match element.resolve_type_alias(db) {
+            match element {
                 Type::Union(union) => pending.extend(union.elements(db).iter().rev().copied()),
-                resolved => builder.add_in_place(resolved),
+                Type::TypeAlias(alias) => {
+                    pending.push(alias.value_type_with_recursion(db, visitor.recursion_context));
+                }
+                Type::Recursive(recursive) => {
+                    if let Some(unfolded) = recursive.unfold(db, visitor).into_unfolded() {
+                        pending.push(unfolded);
+                    } else {
+                        builder.add_in_place(element);
+                    }
+                }
+                element => builder.add_in_place(element),
             }
         }
-        builder.build()
+        let expanded = builder.build();
+        visitor.expanded_unions.borrow_mut().insert(self, expanded);
+        expanded
     }
 
     pub(crate) fn from_elements_cycle_recovery<I, T>(

@@ -59,8 +59,8 @@ use crate::types::function::{FunctionDecorators, FunctionType};
 use crate::types::generics::Specialization;
 use crate::types::unpacker::{UnpackResult, Unpacker};
 use crate::types::{
-    ClassLiteral, KnownClass, RecursiveType, StaticClassLiteral, Type, TypeAndQualifiers,
-    TypeQualifiers,
+    ApplyTypeMappingVisitor, ClassLiteral, KnownClass, RecursiveType, StaticClassLiteral, Type,
+    TypeAndQualifiers, TypeQualifiers,
 };
 use crate::{Db, FxIndexSet};
 
@@ -893,7 +893,7 @@ impl<'db> TypeContext<'db> {
         let union = self.annotation?.as_union_like(db)?;
 
         let targets = if union.has_aliases(db) {
-            let expanded = union.expand_aliases(db, env);
+            let expanded = union.expand_aliases(db, &ApplyTypeMappingVisitor::new(env));
             if let Some(union) = expanded.as_union_like(db) {
                 Cow::Borrowed(union.elements(db))
             } else {

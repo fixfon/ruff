@@ -49,9 +49,10 @@ use crate::types::enums::EnumComplement;
 use crate::types::set_theoretic::expand_intersection_typevars_and_newtypes;
 use crate::types::visitor::any_over_type;
 use crate::types::{
-    BytesLiteralType, ClassLiteral, EnumLiteralType, IntersectionType, KnownClass,
-    KnownInstanceType, LiteralValueType, LiteralValueTypeKind, NegativeIntersectionElements,
-    StringLiteralType, SubclassOfType, Type, TypePair, TypeVarBoundOrConstraints, UnionType,
+    ApplyTypeMappingVisitor, BytesLiteralType, ClassLiteral, EnumLiteralType, IntersectionType,
+    KnownClass, KnownInstanceType, LiteralValueType, LiteralValueTypeKind,
+    NegativeIntersectionElements, StringLiteralType, SubclassOfType, Type, TypePair,
+    TypeVarBoundOrConstraints, UnionType,
 };
 use crate::{Db, FxIndexSet, FxOrderMap, FxOrderSet, ProgramEnvironment};
 use rustc_hash::FxHashSet;
@@ -720,15 +721,20 @@ impl<'db> UnionBuilder<'db> {
 
     fn add_in_place_impl(&mut self, ty: Type<'db>, seen_aliases: &mut Vec<Type<'db>>) {
         let db = self.db;
-        // An unnamed recursive type has no alias name to preserve. Expose its completed body here,
-        // after construction, so ordinary unions retain their normalized form.
-        if let Type::Recursive(recursive) = ty
+        // Ordinary unions expose unnamed recursive types to retain their normalized form.
+        // Inference cycle recovery also needs their bodies to expose divergent markers.
+        // Other transformations that preserve aliases must keep these deferred bodies too.
+        if (self.unpack_aliases || self.cycle_recovery)
+            && let Type::Recursive(recursive) = ty
             && recursive.alias(db).is_none()
         {
             if seen_aliases.contains(&ty) {
                 return;
             }
-            if let Some(unfolded) = recursive.unfold(db, &self.env).into_unfolded() {
+            if let Some(unfolded) = recursive
+                .unfold(db, &ApplyTypeMappingVisitor::new(&self.env))
+                .into_unfolded()
+            {
                 seen_aliases.push(ty);
                 self.add_in_place_impl(unfolded, seen_aliases);
                 return;

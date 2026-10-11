@@ -25,9 +25,9 @@ use crate::types::known_instance::FieldInstance;
 use crate::types::member::class_member;
 use crate::types::special_form::SpecialFormType;
 use crate::types::{
-    ClassBase, ClassType, DataclassTransformerParams, FunctionType, KnownClass, KnownFunction,
-    KnownInstanceType, KnownUnion, Parameter, Specialization, StaticClassLiteral, Type, UnionType,
-    definition_expression_type,
+    ApplyTypeMappingVisitor, ClassBase, ClassType, DataclassTransformerParams, FunctionType,
+    KnownClass, KnownFunction, KnownInstanceType, KnownUnion, Parameter, Specialization,
+    StaticClassLiteral, Type, UnionType, definition_expression_type,
 };
 
 /// Pydantic treats underscore-prefixed annotations as private instance attributes.
@@ -1021,7 +1021,7 @@ fn lax_input_type_impl<'db>(
             return Type::any();
         }
         let result = recursive
-            .unfold(db, env)
+            .unfold(db, &ApplyTypeMappingVisitor::new(env))
             .map(|unfolded| lax_input_type_impl(db, env, unfolded, expanding_types))
             .unwrap_or(Type::any());
         expanding_types.remove(&constructor);
