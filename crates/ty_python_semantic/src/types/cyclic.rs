@@ -233,6 +233,7 @@ struct SpecializationFlowVisitor<'db> {
     edges: RefCell<Vec<FlowEdge<'db>>>,
     referenced_definitions: RefCell<Vec<RecursiveDefinition<'db>>>,
     inconclusive: Cell<bool>,
+    has_unresolved_type: Cell<bool>,
 }
 
 /// Finds which parameters of the current source definition occur in one actual argument.
@@ -571,6 +572,7 @@ impl<'db> SpecializationFlowVisitor<'db> {
             edges: RefCell::default(),
             referenced_definitions: RefCell::default(),
             inconclusive: Cell::default(),
+            has_unresolved_type: Cell::default(),
         })
     }
 
@@ -583,10 +585,14 @@ impl<'db> SpecializationFlowVisitor<'db> {
     }
 
     /// Visits the definition with each formal parameter mapped to itself.
+    /// Returns `false` if the body is incomplete and could still introduce recursive references.
     fn visit_definition_body(&self, db: &'db dyn Db, source: RecursiveDefinition<'db>) -> bool {
         match source {
             RecursiveDefinition::Structural(recursive) => {
-                self.visit_type(db, recursive.unfold(db, &self.env).into_type());
+                let Some(body) = recursive.unfold(db, &self.env).into_unfolded() else {
+                    return false;
+                };
+                self.visit_type(db, body);
             }
             RecursiveDefinition::TypeAlias(alias) => {
                 self.visit_type(db, alias.raw_value_type(db));
@@ -608,7 +614,7 @@ impl<'db> SpecializationFlowVisitor<'db> {
                 }
             }
         }
-        true
+        !self.has_unresolved_type.get()
     }
 
     fn record_reference(&self, db: &'db dyn Db, reference: DefinitionUse<'db>) {
@@ -662,6 +668,13 @@ impl<'db> TypeVisitor<'db> for SpecializationFlowVisitor<'db> {
     }
 
     fn visit_type(&self, db: &'db dyn Db, ty: Type<'db>) {
+        if ty.is_divergent() {
+            // An unfinished body can still introduce a reference back to the root. Until it is
+            // resolved, the absence of that edge does not prove that specialization is bounded.
+            self.has_unresolved_type.set(true);
+            return;
+        }
+
         if let Type::TypeVar(typevar) = ty {
             let identity = RecursiveDefinition::parameter_identity(db, typevar);
             if !self.source_parameters.contains(&identity) {

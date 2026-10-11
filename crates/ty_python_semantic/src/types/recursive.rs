@@ -440,11 +440,26 @@ impl<'db> RecursiveType<'db> {
         let body = match self.body(db) {
             RecursiveBody::Type(body) => body,
             RecursiveBody::TypedDictValues(origin) => {
-                let class = origin.apply_specialization(db, |context| {
-                    self.arguments(db)
-                        .unwrap_or_else(|| context.identity_specialization(db))
-                });
-                return TypedDictType::new(class).unfold_value_type(db);
+                let constructor = self.constructor(db);
+                if self == constructor {
+                    return TypedDictType::new(origin.identity_specialization(db))
+                        .unfold_value_type(db);
+                }
+
+                // Specialize one shared constructor body. Reading each specialized schema can
+                // expose different inference approximations, so growth analysis and unfolding
+                // would follow different recursive references.
+                let body = constructor.unfolded_body(db);
+                let Some(arguments) = self.arguments(db) else {
+                    return body;
+                };
+                let env = self.environment(db);
+                return body.apply_type_mapping_impl(
+                    db,
+                    &TypeMapping::from_specialization(db, arguments, false),
+                    TypeContext::default(),
+                    &ApplyTypeMappingVisitor::new_without_union_normalization(&env),
+                );
             }
         };
         let env = self.environment(db);

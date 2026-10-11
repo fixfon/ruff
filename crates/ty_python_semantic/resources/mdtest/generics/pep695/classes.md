@@ -584,6 +584,65 @@ def check(node: Node[int]):
     reveal_type(node["value"])  # revealed: dict_values[Literal["value"], dict_values[Literal["value"], ...]]
 ```
 
+## Mutually recursive TypedDict value types
+
+These declarations are accepted even though checking either field refers to the other class's
+values. Every trip through both classes wraps the type argument in another `list`:
+
+```py
+from typing import cast
+from typing_extensions import TypedDict
+from ty_extensions._internal import TypeOf
+
+class Left[T](TypedDict, closed=True):
+    # no diagnostic
+    value: TypeOf[next(iter(cast("Right[list[T]]", {}).values()))]
+
+class Right[T](TypedDict, closed=True):
+    # no diagnostic
+    value: TypeOf[next(iter(cast("Left[T]", {}).values()))]
+```
+
+## Mutually recursive TypedDict values inside tuples
+
+The values returned by `Right.values()` can contain the recursive reference inside a tuple. We still
+accept both declarations:
+
+```py
+from typing import cast
+from typing_extensions import TypedDict
+from ty_extensions._internal import TypeOf
+
+class Left[T](TypedDict, closed=True):
+    # no diagnostic
+    value: TypeOf[next(iter(cast("Right[list[T]]", {}).values()))]
+
+class Right[T](TypedDict, closed=True):
+    # no diagnostic
+    value: tuple[TypeOf[next(iter(cast("Left[T]", {}).values()))]]
+```
+
+## Recursive TypedDict values with fixed arguments
+
+A recursive reference can replace the type argument with a fixed type. Here `Right` always refers to
+`Left[int]`, so `Left[str]`'s `value` field still contains `int`:
+
+```py
+from typing import cast
+from typing_extensions import TypedDict
+from ty_extensions._internal import TypeOf
+
+class Left[T](TypedDict, closed=True):
+    item: T
+    value: TypeOf[next(iter(cast("Right[list[T]]", {}).values()))]
+
+class Right[T](TypedDict, closed=True):
+    value: TypeOf[next(iter(cast("Left[int]", {}).values()))]
+
+def check(left: Left[str]):
+    reveal_type(left["value"])  # revealed: int
+```
+
 ## Diagnostics for bad specializations
 
 We show the user where the type variable was defined if a specialization is given that doesn't
