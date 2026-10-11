@@ -576,12 +576,43 @@ impl<'db> RecursiveType<'db> {
         }
     }
 
+    /// Compose argument variance with the constructor's formal parameters instead of unfolding
+    /// successively larger applications such as `Values[list[T]]`.
     pub(in crate::types) fn variance_equation(
         self,
         db: &'db dyn Db,
         typevar: BoundTypeVarIdentity<'db>,
     ) -> VarianceTerm<'db> {
         let env = self.environment(db);
+        if let Some(arguments) = self.arguments(db) {
+            let parameters = arguments.generic_context(db);
+            let constructor = self.with_arguments(
+                db,
+                Some(
+                    parameters
+                        .identity_specialization(db)
+                        .with_materialization_kind(db, arguments.materialization_kind(db)),
+                ),
+            );
+            if constructor != self {
+                let origin = VarianceOrigin::Recursive(constructor);
+                let variances = parameters.variables(db).zip(arguments.types(db)).map(
+                    |(parameter, argument)| {
+                        argument
+                            .variance_of(db, &env, typevar)
+                            .compose_thunk(db, || {
+                                VarianceTerm::variable(db, origin, parameter.identity(db))
+                            })
+                    },
+                );
+                // A constructor can also capture a type variable from an enclosing scope.
+                let captured = (!parameters
+                    .variables(db)
+                    .any(|parameter| parameter.identity(db) == typevar))
+                .then(|| VarianceTerm::variable(db, origin, typevar));
+                return VarianceTerm::join(db, variances.chain(captured));
+            }
+        }
         self.unfold(db, &env)
             .map(|unfolded| unfolded.variance_of(db, &env, typevar))
             .unwrap_or(VarianceTerm::BIVARIANT)

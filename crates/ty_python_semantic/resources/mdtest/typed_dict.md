@@ -4913,6 +4913,45 @@ missing_primary_from_dict_call = Logical(primary=dict(field="a"), conditions=[di
 missing_primary_from_literal = Logical(primary={"field": "a"}, conditions=[dict(field="c", value="d")])
 ```
 
+## Displaying recursive value types
+
+A field can contain a view of the same dictionary's values. `TypeOf` lets us express that field
+type. We display the surrounding view and use `...` where expanding the recursive type would repeat
+it:
+
+```py
+from typing import cast
+from typing_extensions import TypedDict
+from ty_extensions._internal import TypeOf
+
+class Node(TypedDict, closed=True):
+    value: TypeOf[cast("Node", {}).values()]
+
+def check(node: Node):
+    reveal_type(node["value"])  # revealed: dict_values[Literal["value"], dict_values[Literal["value"], ...]]
+```
+
+## Displaying mutually recursive value types
+
+The recursive reference can pass through another dictionary's values before returning to the
+original type:
+
+```py
+from typing import cast
+from typing_extensions import TypedDict
+from ty_extensions._internal import TypeOf
+
+class Left(TypedDict, closed=True):
+    right: TypeOf[cast("Right", {}).values()]
+
+class Right(TypedDict, closed=True):
+    left: TypeOf[cast(Left, {}).values()]
+
+def check(left: Left):
+    # revealed: dict_values[Literal["left"], dict_values[Literal["right"], dict_values[Literal["left"], ...]]]
+    reveal_type(left["right"])
+```
+
 ## Function/assignment syntax
 
 TypedDicts can be created using the functional syntax:

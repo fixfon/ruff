@@ -910,6 +910,25 @@ def check(maximum: Top[Record[Any]], minimum: Bottom[Record[Any]]):
     reveal_type(minimum.get("other"))  # revealed: None
 ```
 
+## Displaying nested TypedDict values
+
+Finite nesting is displayed in full. Each tuple element also gets its own complete display:
+
+```py
+from typing import Generic, TypeVar
+from typing_extensions import TypedDict
+
+T = TypeVar("T")
+
+class Record(TypedDict, Generic[T], closed=True):
+    value: T
+
+def check(node: Record[int]):
+    nested = Record(value=node.values())
+    # revealed: tuple[dict_values[Literal["value"], dict_values[str, int]], dict_values[Literal["value"], dict_values[str, int]]]
+    reveal_type((nested.values(), nested.values()))
+```
+
 ## Reusing TypedDict values in a loop
 
 Each iteration puts the previous dictionary view into a new `Node`. Inference retains the initial
@@ -929,6 +948,25 @@ def check(condition: bool):
     while condition:
         node = Node(value=node.values())
     reveal_type(node)  # revealed: Node[int] | Node[Divergent]
+```
+
+## Displaying recursive TypedDict values
+
+Each recursive reference below adds another `list` to the type argument. Display abbreviates the
+recursive view even though the specialization changes:
+
+```py
+from typing import Generic, TypeVar, cast
+from typing_extensions import TypedDict
+from ty_extensions._internal import TypeOf
+
+T = TypeVar("T")
+
+class Node(TypedDict, Generic[T], closed=True):
+    value: TypeOf[cast("Node[list[T]]", {}).values()]
+
+def check(node: Node[int]):
+    reveal_type(node["value"])  # revealed: dict_values[Literal["value"], dict_values[Literal["value"], ...]]
 ```
 
 ## Diagnostics for bad specializations
