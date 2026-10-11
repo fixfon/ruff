@@ -413,7 +413,9 @@ impl<'db> RecursiveType<'db> {
         db: &'db dyn Db,
         visitor: &ApplyTypeMappingVisitor<'_, 'db>,
     ) -> UnfoldResult<'db> {
-        let unfolded = self.unfolded_body(db);
+        // Materialize the original body so each recursive reference is transformed according
+        // to its variance, rather than inheriting the enclosing application's materialization.
+        let unfolded = self.with_materialization(db, None).unfolded_body(db);
         let unfolded = match self.materialization_kind(db) {
             Some(kind) => unfolded.materialize(db, kind, visitor),
             None => unfolded,
