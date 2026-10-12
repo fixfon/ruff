@@ -155,7 +155,7 @@ impl<'env, 'db, O> TypeTraversal<'env, 'db, O> {
         }
     }
 
-    pub fn environment(&self) -> &ProgramEnvironment<'db> {
+    pub(crate) fn environment(&self) -> &ProgramEnvironment<'db> {
         self.env
     }
 
@@ -202,7 +202,12 @@ impl<'env, 'db, O> TypeTraversal<'env, 'db, O> {
     }
 
     /// Visit a type while passing operation-specific state, such as a mutable type builder.
-    pub fn visit_with<State>(&self, db: &'db dyn Db, ty: Type<'db>, state: State) -> O::Output
+    pub(crate) fn visit_with<State>(
+        &self,
+        db: &'db dyn Db,
+        ty: Type<'db>,
+        state: State,
+    ) -> O::Output
     where
         O: TypeOperation<'db, State>,
     {
@@ -567,7 +572,7 @@ impl<'db> RecursiveType<'db> {
     }
 
     /// The program in which the recursive type's body was constructed.
-    pub fn environment(self, db: &'db dyn Db) -> ProgramEnvironment<'db> {
+    pub(crate) fn environment(self, db: &'db dyn Db) -> ProgramEnvironment<'db> {
         ProgramEnvironment::from_definition(self.definition(db))
     }
 

@@ -925,7 +925,7 @@ where
     T: Hash + Eq + Clone + HasIdentity<'db>,
 {
     #[inline]
-    pub fn visit(&self, db: &'db dyn Db, item: T, compute: impl FnOnce() -> R) -> R {
+    pub(crate) fn visit(&self, db: &'db dyn Db, item: T, compute: impl FnOnce() -> R) -> R {
         match self.begin_visit(db, item) {
             CycleDetectorVisit::Ready(result) => result,
             CycleDetectorVisit::Cycle(_) => self.fallback.clone(),
