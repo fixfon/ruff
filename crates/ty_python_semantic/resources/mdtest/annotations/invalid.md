@@ -68,6 +68,27 @@ def _(
     reveal_type(e)  # revealed: Unknown
 ```
 
+## Recursive value types
+
+The value type of this dictionary includes `int` and a reference to the same value type.
+
+```py
+from typing import cast
+from typing_extensions import TypedDict
+from ty_extensions._internal import TypeOf
+
+class Node(TypedDict, closed=True):
+    leaf: int
+    child: TypeOf[next(iter(cast("Node", {}).values()))]
+```
+
+Using such a value in an annotation reports the invalid `int` alternative:
+
+```py
+value = next(iter(cast(Node, {}).values()))
+x: value  # error: [invalid-type-form] "Variable of type `int` is not allowed in a type expression"
+```
+
 ## Invalid AST nodes
 
 ```py

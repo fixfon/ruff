@@ -281,6 +281,24 @@ def _(a: AllKeysNotRequired) -> None:
     reveal_type(bool(a))  # revealed: bool
 ```
 
+## Recursive value types
+
+A recursive reference to the same value type does not add a falsy alternative:
+
+```py
+from typing import cast
+from typing_extensions import Literal, TypedDict
+from ty_extensions._internal import TypeOf
+
+class Node(TypedDict, closed=True):
+    leaf: Literal[True]
+    child: TypeOf[next(iter(cast("Node", {}).values()))]
+
+def check(node: Node):
+    value = next(iter(node.values()))
+    reveal_type(bool(value))  # revealed: Literal[True]
+```
+
 ## Uninhabited values
 
 Calling `bool` with an argument of type `Never` retains the constructor's return type.

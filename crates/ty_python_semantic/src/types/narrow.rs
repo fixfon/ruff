@@ -18,10 +18,10 @@ use crate::types::typed_dict::{TypedDictFieldBuilder, TypedDictSchema, TypedDict
 use crate::types::unpacker::collected_list_type;
 use crate::types::{
     ApplyTypeMappingVisitor, CallableType, ClassBase, ClassLiteral, ClassPatternPositionalSource,
-    ClassType, CycleDetector, IntersectionBuilder, IntersectionType, KnownClass, KnownInstanceType,
-    LiteralValueTypeKind, Parameter, Parameters, Signature, SpecialFormType, SubclassOfInner,
-    SubclassOfType, Truthiness, Type, TypeContext, TypeVarBoundOrConstraints, UnfoldResult,
-    UnionBuilder, binding_type, class_pattern_positional_sources,
+    ClassType, CycleDetector, CycleKind, IntersectionBuilder, IntersectionType, KnownClass,
+    KnownInstanceType, LiteralValueTypeKind, Parameter, Parameters, Signature, SpecialFormType,
+    SubclassOfInner, SubclassOfType, Truthiness, Type, TypeContext, TypeOperation, TypeTraversal,
+    TypeVarBoundOrConstraints, UnionBuilder, binding_type, class_pattern_positional_sources,
     definite_match_pattern_type_for_subject, exact_sequence_pattern_type, infer_expression_types,
     mapping_pattern_type, pattern_binding_fallthrough_type, sequence_pattern_type_builder,
     singleton_pattern_type, starred_sequence_pattern_type, typed_dict_matches_class_pattern,
@@ -4315,7 +4315,7 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
             && let Some(key) = inference.expression_type(left).as_string_literal()
             && let rhs_expr = right.expression_value()
             && let rhs_type = inference.expression_type(right)
-            && is_or_contains_typeddict(db, rhs_type)
+            && is_or_contains_typeddict(db, &self.env, rhs_type)
         {
             let key = key.value(db);
             let apply_constraint =
@@ -5128,7 +5128,7 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
     ) -> Option<(ScopedPlaceId, NarrowingConstraint<'db>)> {
         let db = self.db;
         // Check preconditions: we need a TypedDict and a string key.
-        if !is_or_contains_typeddict(db, subscript_value_type) {
+        if !is_or_contains_typeddict(db, &self.env, subscript_value_type) {
             return None;
         }
         let subscript_place_expr = PlaceExpr::try_from_expr(subscript_value_expr)?;
@@ -5194,7 +5194,7 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
         is_positive: bool,
     ) -> Option<(ScopedPlaceId, NarrowingConstraint<'db>)> {
         let db = self.db;
-        if !is_or_contains_typeddict(db, subscript_value_type) {
+        if !is_or_contains_typeddict(db, &self.env, subscript_value_type) {
             return None;
         }
         let subscript_place_expr = PlaceExpr::try_from_expr(subscript_value_expr)?;
@@ -5220,31 +5220,7 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
     // `NarrowingConstraint::intersection` at the call site instead of constructing a replacement
     // type here.
     fn narrow_with_present_key(&self, ty: Type<'db>, key: &str) -> Type<'db> {
-        let db = self.db;
-        let constrain = |ty, key_presence_constraint| {
-            IntersectionType::from_two_elements(db, &self.env, ty, key_presence_constraint)
-        };
-
-        match ty.resolve_type_alias(db) {
-            Type::Union(union) => union.map(db, &self.env, |element| {
-                self.narrow_with_present_key(*element, key)
-            }),
-            Type::TypedDict(typed_dict)
-                if typed_dict
-                    .key_membership_truthiness(db, key)
-                    .is_always_false() =>
-            {
-                Type::Never
-            }
-            resolved if typeddict_declares_key(db, resolved, key) => resolved,
-            // TODO: Extend this to subtypes of `Mapping[str, object]` whose membership and
-            // subscript operations obey the `Mapping` contract.
-            resolved if is_or_contains_typeddict(db, resolved) => constrain(
-                ty,
-                Type::TypedDict(required_typeddict_key(db, key, Type::object())),
-            ),
-            _ => constrain(ty, key_membership_contains_protocol(db, &self.env, key)),
-        }
+        TypeTraversal::new(&self.env, NarrowWithPresentKey(key)).visit(self.db, ty)
     }
 
     /// Narrow unions of tuples by comparing an element's value.
@@ -5478,76 +5454,113 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
     }
 }
 
-// Return true if the given type is a `TypedDict` or a union or intersection that includes at least
-// one `TypedDict` (even if other types are also present), or a type alias to such a type.
-fn is_or_contains_typeddict<'db>(db: &'db dyn Db, ty: Type<'db>) -> bool {
-    match ty {
-        Type::RecursiveVar(_) => {
-            unreachable!("semantic operation on an unbound recursive variable")
-        }
-        Type::TypedDict(_) => true,
-        Type::Intersection(intersection) => intersection
-            .positive(db)
-            .iter()
-            .any(|intersection_element_ty| is_or_contains_typeddict(db, *intersection_element_ty)),
-        Type::Union(union) => union
-            .elements(db)
-            .iter()
-            .any(|union_member_ty| is_or_contains_typeddict(db, *union_member_ty)),
-        Type::TypeAlias(alias) => is_or_contains_typeddict(db, alias.value_type(db)),
-        Type::Recursive(recursive) => recursive
-            .unfold(
-                db,
-                &ApplyTypeMappingVisitor::new(&recursive.environment(db)),
-            )
-            .is_unfolded_and(|unfolded| is_or_contains_typeddict(db, unfolded)),
+struct NarrowWithPresentKey<'a>(&'a str);
 
-        Type::Dynamic(_)
-        | Type::Divergent(_)
-        | Type::Never
-        | Type::EnumComplement(_)
-        | Type::FunctionLiteral(_)
-        | Type::BoundMethod(_)
-        | Type::KnownBoundMethod(_)
-        | Type::WrapperDescriptor(_)
-        | Type::DataclassDecorator(_)
-        | Type::DataclassTransformer(_)
-        | Type::Callable(_)
-        | Type::ModuleLiteral(_)
-        | Type::ClassLiteral(_)
-        | Type::GenericAlias(_)
-        | Type::SubclassOf(_)
-        | Type::NominalInstance(_)
-        | Type::ProtocolInstance(_)
-        | Type::SpecialForm(_)
-        | Type::KnownInstance(_)
-        | Type::PropertyInstance(_)
-        | Type::SlotDescriptor(_)
-        | Type::AlwaysTruthy
-        | Type::AlwaysFalsy
-        | Type::LiteralValue(_)
-        | Type::TypeVar(_)
-        | Type::BoundSuper(_)
-        | Type::TypeIs(_)
-        | Type::TypeGuard(_)
-        | Type::TypeForm(_)
-        | Type::NewTypeInstance(_) => false,
+impl<'db> TypeOperation<'db> for NarrowWithPresentKey<'_> {
+    type Output = Type<'db>;
+
+    fn on_cycle(
+        &self,
+        _traversal: &TypeTraversal<'_, 'db, Self>,
+        ty: Type<'db>,
+        kind: CycleKind,
+        _state: (),
+    ) -> Self::Output {
+        match kind {
+            CycleKind::Exact => Type::Never,
+            CycleKind::MatchingIdentity => ty,
+        }
+    }
+
+    fn visit(
+        &self,
+        db: &'db dyn Db,
+        traversal: &TypeTraversal<'_, 'db, Self>,
+        ty: Type<'db>,
+        _state: (),
+    ) -> Self::Output {
+        let env = traversal.environment();
+        let key = self.0;
+        let constrain = |ty, key_presence_constraint| {
+            IntersectionType::from_two_elements(db, env, ty, key_presence_constraint)
+        };
+
+        match ty {
+            Type::Union(union) => union.map(db, env, |element| traversal.visit(db, *element)),
+            Type::TypedDict(typed_dict)
+                if typed_dict
+                    .key_membership_truthiness(db, key)
+                    .is_always_false() =>
+            {
+                Type::Never
+            }
+            resolved if typeddict_declares_key(db, env, resolved, key) => resolved,
+            // TODO: Extend this to subtypes of `Mapping[str, object]` whose membership and
+            // subscript operations obey the `Mapping` contract.
+            resolved if is_or_contains_typeddict(db, env, resolved) => constrain(
+                ty,
+                Type::TypedDict(required_typeddict_key(db, key, Type::object())),
+            ),
+            _ => constrain(ty, key_membership_contains_protocol(db, env, key)),
+        }
     }
 }
 
-fn typeddict_declares_key<'db>(db: &'db dyn Db, ty: Type<'db>, key: &str) -> bool {
-    match ty {
-        Type::TypedDict(typed_dict) => typed_dict.items(db).contains_key(key),
-        Type::Intersection(intersection) => intersection
-            .positive(db)
-            .iter()
-            .any(|element| typeddict_declares_key(db, *element, key)),
-        Type::Union(union) => union
-            .elements(db)
-            .iter()
-            .any(|element| typeddict_declares_key(db, *element, key)),
-        Type::TypeAlias(alias) => typeddict_declares_key(db, alias.value_type(db), key),
-        _ => false,
+// Return true if the given type is a `TypedDict` or a union or intersection that includes at least
+// one `TypedDict` (even if other types are also present), or a type alias to such a type.
+fn is_or_contains_typeddict<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    ty: Type<'db>,
+) -> bool {
+    TypeTraversal::new(env, ContainsTypedDict { key: None }).visit(db, ty)
+}
+
+fn typeddict_declares_key<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    ty: Type<'db>,
+    key: &str,
+) -> bool {
+    TypeTraversal::new(env, ContainsTypedDict { key: Some(key) }).visit(db, ty)
+}
+
+struct ContainsTypedDict<'a> {
+    key: Option<&'a str>,
+}
+
+impl<'db> TypeOperation<'db> for ContainsTypedDict<'_> {
+    type Output = bool;
+
+    fn on_cycle(
+        &self,
+        _traversal: &TypeTraversal<'_, 'db, Self>,
+        _ty: Type<'db>,
+        _kind: CycleKind,
+        _state: (),
+    ) -> bool {
+        false
+    }
+
+    fn visit(
+        &self,
+        db: &'db dyn Db,
+        traversal: &TypeTraversal<'_, 'db, Self>,
+        ty: Type<'db>,
+        _state: (),
+    ) -> bool {
+        match ty {
+            Type::TypedDict(td) => self.key.is_none_or(|key| td.items(db).contains_key(key)),
+            Type::Union(union) => union
+                .elements(db)
+                .iter()
+                .any(|element| traversal.visit(db, *element)),
+            Type::Intersection(intersection) => intersection
+                .positive(db)
+                .iter()
+                .any(|element| traversal.visit(db, *element)),
+            _ => false,
+        }
     }
 }
 
@@ -5625,40 +5638,47 @@ fn visit_matching_typeddict_field_types<'db>(
     field_name: &str,
     visit: &mut impl FnMut(Type<'db>),
 ) {
-    let elements = match ty {
-        Type::RecursiveVar(_) => {
-            unreachable!("semantic operation on an unbound recursive variable")
-        }
-        Type::TypedDict(td) => {
-            if let Some(field) = td.items(db).get(field_name) {
-                visit(field.declared_ty);
-            }
-            return;
-        }
-        Type::TypeAlias(alias) => {
-            return visit_matching_typeddict_field_types(
-                db,
-                env,
-                alias.value_type(db),
-                field_name,
-                visit,
-            );
-        }
-        Type::Recursive(recursive) => {
-            if let UnfoldResult::Unfolded(unfolded) =
-                recursive.unfold(db, &ApplyTypeMappingVisitor::new(env))
-            {
-                visit_matching_typeddict_field_types(db, env, unfolded, field_name, visit);
-            }
-            return;
-        }
-        Type::Union(union) => Either::Left(union.elements(db).iter()),
-        Type::Intersection(intersection) => Either::Right(intersection.positive(db).iter()),
-        _ => return,
-    };
+    TypeTraversal::new(env, VisitTypedDictField { field_name }).visit_with(db, ty, visit);
+}
 
-    for element in elements {
-        visit_matching_typeddict_field_types(db, env, *element, field_name, visit);
+struct VisitTypedDictField<'a> {
+    field_name: &'a str,
+}
+
+impl<'a, 'db, F: FnMut(Type<'db>)> TypeOperation<'db, &'a mut F> for VisitTypedDictField<'_> {
+    type Output = ();
+
+    fn on_cycle(
+        &self,
+        _traversal: &TypeTraversal<'_, 'db, Self>,
+        _ty: Type<'db>,
+        _kind: CycleKind,
+        _visit: &'a mut F,
+    ) {
+    }
+
+    fn visit(
+        &self,
+        db: &'db dyn Db,
+        traversal: &TypeTraversal<'_, 'db, Self>,
+        ty: Type<'db>,
+        visit: &'a mut F,
+    ) {
+        let elements = match ty {
+            Type::TypedDict(td) => {
+                if let Some(field) = td.items(db).get(self.field_name) {
+                    visit(field.declared_ty);
+                }
+                return;
+            }
+            Type::Union(union) => Either::Left(union.elements(db).iter()),
+            Type::Intersection(intersection) => Either::Right(intersection.positive(db).iter()),
+            _ => return,
+        };
+
+        for element in elements {
+            traversal.visit_with(db, *element, &mut *visit);
+        }
     }
 }
 

@@ -66,20 +66,191 @@
 //! before inspecting the values. These projections have no source alias name; ordinary union
 //! construction and type display expand their completed bodies.
 
+use std::cell::OnceCell;
+
 use salsa::plumbing::AsId;
 use ty_python_core::definition::Definition;
 use ty_python_core::place_table;
 
 use super::constraints::{ConstraintSet, IteratorConstraintsExtension};
+use super::cyclic::{CycleDetector, CycleKind};
 use super::generics::{ApplySpecialization, Specialization};
 use super::relation::{TypeRelation, TypeRelationChecker};
 use super::type_alias::AliasCycleSummary;
 use super::variance::{VarianceInferable, VarianceOrigin};
 use super::{
     ApplyTypeMappingVisitor, BoundTypeVarIdentity, ClassLiteral, ClassType, GenericContext,
-    MaterializationKind, Type, TypeContext, TypeMapping, TypedDictType, VarianceTerm,
+    MaterializationKind, Type, TypeContext, TypeMapping, TypeRecursionContext, TypedDictType,
+    VarianceTerm,
 };
 use crate::{Db, ProgramEnvironment};
+
+/// An operation on the outer shape of a type.
+///
+/// [`TypeTraversal`] expands aliases and recursive types before calling [`Self::visit`].
+/// A recursive reference whose body is still unavailable is passed through unchanged.
+/// Implementations select which other children to inspect by calling the traversal's `visit`
+/// method. They never unfold recursive bodies or manage the active recursion stack themselves.
+/// `State` passes per-visit inputs, including mutable builders, without storing them in the traversal.
+pub trait TypeOperation<'db, State = ()>: Sized {
+    type Output;
+
+    fn visit(
+        &self,
+        db: &'db dyn Db,
+        traversal: &TypeTraversal<'_, 'db, Self>,
+        ty: Type<'db>,
+        state: State,
+    ) -> Self::Output;
+
+    /// Return the result of revisiting an active type, including a growing specialization.
+    fn on_cycle(
+        &self,
+        _traversal: &TypeTraversal<'_, 'db, Self>,
+        ty: Type<'db>,
+        kind: CycleKind,
+        state: State,
+    ) -> Self::Output;
+
+    /// Process an alias or recursive type with its traversal guard active.
+    ///
+    /// Operations that can start another projection while expanding an alias can retain their
+    /// additional context here. Calling `visit_body` unfolds and visits the body under that guard;
+    /// an operation can also retain the reference without invoking the callback.
+    fn visit_alias_like(
+        &self,
+        _db: &'db dyn Db,
+        _traversal: &TypeTraversal<'_, 'db, Self>,
+        _ty: Type<'db>,
+        state: State,
+        visit_body: impl FnOnce(State) -> Self::Output,
+    ) -> Self::Output {
+        visit_body(state)
+    }
+}
+
+struct TypeTraversalTag;
+
+/// Owns the recursion and materialization state for one type operation.
+///
+/// A recursive body can expose a union that contains the same recursive type again. The guard
+/// therefore covers both unfolding and the operation's subsequent traversal of that body.
+/// Completed results are not cached: a result reached through a cycle can depend on its parents.
+pub struct TypeTraversal<'env, 'db, O> {
+    operation: O,
+    env: &'env ProgramEnvironment<'db>,
+    recursion_context: Option<&'env TypeRecursionContext<'db>>,
+    mapping: TraversalMapping<'env, 'db>,
+    active: CycleDetector<'db, TypeTraversalTag, Type<'db>, (), 3>,
+}
+
+impl<'env, 'db, O> TypeTraversal<'env, 'db, O> {
+    pub fn new(env: &'env ProgramEnvironment<'db>, operation: O) -> Self {
+        Self {
+            operation,
+            env,
+            recursion_context: None,
+            mapping: TraversalMapping::Owned(OnceCell::new()),
+            active: CycleDetector::new(()),
+        }
+    }
+
+    pub fn environment(&self) -> &ProgramEnvironment<'db> {
+        self.env
+    }
+
+    pub(super) fn mapping_visitor(&self) -> &ApplyTypeMappingVisitor<'env, 'db> {
+        match &self.mapping {
+            TraversalMapping::Owned(mapping) => mapping.get_or_init(|| {
+                ApplyTypeMappingVisitor::new(self.env)
+                    .with_recursion_context(self.recursion_context)
+            }),
+            TraversalMapping::Borrowed(mapping) => mapping,
+        }
+    }
+
+    pub(super) fn new_with_recursion_context(
+        env: &'env ProgramEnvironment<'db>,
+        operation: O,
+        context: &'env TypeRecursionContext<'db>,
+    ) -> Self {
+        Self {
+            recursion_context: Some(context),
+            ..Self::new(env, operation)
+        }
+    }
+
+    /// Start a traversal inside a transformation without replacing that transformation's guards.
+    pub(super) fn from_mapping_visitor(
+        visitor: &'env ApplyTypeMappingVisitor<'env, 'db>,
+        operation: O,
+    ) -> Self {
+        Self {
+            operation,
+            env: visitor.env,
+            recursion_context: visitor.recursion_context,
+            mapping: TraversalMapping::Borrowed(visitor),
+            active: CycleDetector::new(()),
+        }
+    }
+
+    pub fn visit(&self, db: &'db dyn Db, ty: Type<'db>) -> O::Output
+    where
+        O: TypeOperation<'db>,
+    {
+        self.visit_with(db, ty, ())
+    }
+
+    /// Visit a type while passing operation-specific state, such as a mutable type builder.
+    pub fn visit_with<State>(&self, db: &'db dyn Db, ty: Type<'db>, state: State) -> O::Output
+    where
+        O: TypeOperation<'db, State>,
+    {
+        // These outer-shape walks recurse through deferred definitions, bounds, and newtype
+        // bases. Guard those boundaries so a cycle result retains the reference to its definition.
+        // Revisiting a concrete type during builder normalization is not a recursive unfolding.
+        if !matches!(
+            ty,
+            Type::TypeAlias(_) | Type::Recursive(_) | Type::TypeVar(_) | Type::NewTypeInstance(_)
+        ) {
+            return self.operation.visit(db, self, ty, state);
+        }
+        self.active.visit_active(db, ty, |cycle| {
+            if let Some(kind) = cycle {
+                return self.operation.on_cycle(self, ty, kind, state);
+            }
+            match ty {
+                Type::Recursive(recursive) => {
+                    self.operation
+                        .visit_alias_like(db, self, ty, state, |state| {
+                            match recursive.unfold(db, self.mapping_visitor()) {
+                                UnfoldResult::Unfolded(body) => self.visit_with(db, body, state),
+                                UnfoldResult::Unchanged(_) => {
+                                    self.operation.visit(db, self, ty, state)
+                                }
+                            }
+                        })
+                }
+                Type::TypeAlias(alias) => {
+                    self.operation
+                        .visit_alias_like(db, self, ty, state, |state| {
+                            self.visit_with(
+                                db,
+                                alias.value_type_with_recursion(db, self.recursion_context),
+                                state,
+                            )
+                        })
+                }
+                _ => self.operation.visit(db, self, ty, state),
+            }
+        })
+    }
+}
+
+enum TraversalMapping<'env, 'db> {
+    Owned(OnceCell<ApplyTypeMappingVisitor<'env, 'db>>),
+    Borrowed(&'env ApplyTypeMappingVisitor<'env, 'db>),
+}
 
 /// A recursive variable named by its binder's query cycle.
 /// An escaping reference has no type semantics; in particular, it is neither a
@@ -404,11 +575,12 @@ impl<'db> RecursiveType<'db> {
     ///
     /// Report whether unfolding returns exactly `Type::Recursive(self)`. An unfolded
     /// type can still contain recursive references, so callers must retain their recursion guards.
+    /// General type inspections use [`TypeTraversal`], which owns those guards across the visit.
     ///
     /// Materializing the body can compare an argument with its materialization, which can unfold
     /// another application of this constructor. Keep the caller's equivalence guard so growing
     /// arguments do not restart that comparison with an empty recursion stack.
-    pub fn unfold(
+    pub(in crate::types) fn unfold(
         self,
         db: &'db dyn Db,
         visitor: &ApplyTypeMappingVisitor<'_, 'db>,
@@ -534,8 +706,8 @@ impl<'db> RecursiveType<'db> {
             }
             TypeMapping::Materialize(kind) => {
                 visitor.visit(db, Type::Recursive(self), mapping, || {
-                    self.unfold(db, visitor)
-                        .map(|unfolded| {
+                    match self.unfold(db, visitor) {
+                        UnfoldResult::Unfolded(unfolded) => {
                             let mapped =
                                 unfolded.apply_type_mapping_impl(db, mapping, tcx, visitor);
                             // Preserve static aliases, including recursive references that the
@@ -545,8 +717,13 @@ impl<'db> RecursiveType<'db> {
                             } else {
                                 self.with_materialization(db, Some(*kind))
                             })
-                        })
-                        .into_type()
+                        }
+                        // A deferred body cannot establish that materialization is a no-op.
+                        // Retain the operation so it applies when the body becomes available.
+                        UnfoldResult::Unchanged(_) => {
+                            Type::Recursive(self.with_materialization(db, Some(*kind)))
+                        }
+                    }
                 })
             }
             TypeMapping::EagerExpansion => {
@@ -637,7 +814,7 @@ impl<'db> RecursiveType<'db> {
 /// when unfolding made no progress.
 #[derive(Debug, Clone, Copy)]
 #[must_use]
-pub enum UnfoldResult<'db, T = Type<'db>> {
+pub(crate) enum UnfoldResult<'db, T = Type<'db>> {
     /// The unfolded type, or a value produced by mapping it.
     Unfolded(T),
     /// Unfolding returns the original recursive type, for example for `μa. a`.
@@ -650,7 +827,7 @@ impl<'db> UnfoldResult<'db, Type<'db>> {
     /// Callers that recursively process the returned type must use their own recursion guards.
     /// Unfolding one layer does not eliminate cycles, even when it makes progress.
     #[inline]
-    pub fn into_type(self) -> Type<'db> {
+    pub(super) fn into_type(self) -> Type<'db> {
         match self {
             Self::Unfolded(ty) => ty,
             Self::Unchanged(recursive) => Type::Recursive(recursive),
@@ -700,15 +877,6 @@ impl<'db, T> UnfoldResult<'db, T> {
         match self {
             Self::Unfolded(value) => UnfoldResult::Unfolded(operation(value)),
             Self::Unchanged(recursive) => UnfoldResult::Unchanged(recursive),
-        }
-    }
-
-    /// Return the contained value, or call `fallback` if unfolding made no progress.
-    #[inline]
-    pub(crate) fn unwrap_or_else(self, fallback: impl FnOnce() -> T) -> T {
-        match self {
-            Self::Unfolded(value) => value,
-            Self::Unchanged(_) => fallback(),
         }
     }
 

@@ -20,10 +20,10 @@ use crate::types::signatures::CallableSignature;
 use crate::types::tuple::TupleType;
 use crate::types::visitor::any_over_type;
 use crate::types::{
-    CallableType, ClassBase, ClassLiteral, EnumLiteralType, IntersectionBuilder, KnownClass,
-    Parameter, Parameters, Signature, SpecialFormType, Type, TypeContext,
-    TypeVarBoundOrConstraints, TypedDictType, UnionType, binding_type, equality_truthiness,
-    infer_same_file_expression_type,
+    CallableType, ClassBase, ClassLiteral, CycleKind, EnumLiteralType, IntersectionBuilder,
+    KnownClass, Parameter, Parameters, Signature, SpecialFormType, Type, TypeContext,
+    TypeOperation, TypeTraversal, TypeVarBoundOrConstraints, TypedDictType, UnionType,
+    binding_type, equality_truthiness, infer_same_file_expression_type,
 };
 
 /// Identifies a pattern by its address and subject type without hashing the pattern subtree.
@@ -115,28 +115,57 @@ fn typed_dict_pattern_domain_satisfies<'db>(
     ty: Type<'db>,
     predicate: &mut impl FnMut(TypedDictType<'db>) -> bool,
 ) -> bool {
-    match ty.resolve_type_alias(db) {
-        Type::TypedDict(typed_dict) => predicate(typed_dict),
-        Type::TypeVar(typevar) => match typevar.typevar(db).bound_or_constraints(db, env) {
-            Some(TypeVarBoundOrConstraints::UpperBound(bound)) => {
-                typed_dict_pattern_domain_satisfies(db, env, bound, predicate)
-            }
-            Some(TypeVarBoundOrConstraints::Constraints(constraints)) => {
-                constraints.elements(db).iter().all(|constraint| {
-                    typed_dict_pattern_domain_satisfies(db, env, *constraint, predicate)
-                })
-            }
-            None => false,
-        },
-        Type::Union(union) => union
-            .elements(db)
-            .iter()
-            .all(|element| typed_dict_pattern_domain_satisfies(db, env, *element, predicate)),
-        Type::Intersection(intersection) => intersection
-            .positive(db)
-            .iter()
-            .any(|element| typed_dict_pattern_domain_satisfies(db, env, *element, predicate)),
-        _ => false,
+    TypeTraversal::new(env, TypedDictPatternDomain).visit_with(db, ty, predicate)
+}
+
+struct TypedDictPatternDomain;
+
+impl<'a, 'db, F> TypeOperation<'db, &'a mut F> for TypedDictPatternDomain
+where
+    F: FnMut(TypedDictType<'db>) -> bool,
+{
+    type Output = bool;
+
+    fn on_cycle(
+        &self,
+        _traversal: &TypeTraversal<'_, 'db, Self>,
+        _ty: Type<'db>,
+        kind: CycleKind,
+        _predicate: &'a mut F,
+    ) -> bool {
+        kind == CycleKind::Exact
+    }
+
+    fn visit(
+        &self,
+        db: &'db dyn Db,
+        traversal: &TypeTraversal<'_, 'db, Self>,
+        ty: Type<'db>,
+        predicate: &'a mut F,
+    ) -> bool {
+        let env = traversal.environment();
+        match ty {
+            Type::TypedDict(typed_dict) => predicate(typed_dict),
+            Type::TypeVar(typevar) => match typevar.typevar(db).bound_or_constraints(db, env) {
+                Some(TypeVarBoundOrConstraints::UpperBound(bound)) => {
+                    traversal.visit_with(db, bound, predicate)
+                }
+                Some(TypeVarBoundOrConstraints::Constraints(constraints)) => constraints
+                    .elements(db)
+                    .iter()
+                    .all(|constraint| traversal.visit_with(db, *constraint, &mut *predicate)),
+                None => false,
+            },
+            Type::Union(union) => union
+                .elements(db)
+                .iter()
+                .all(|element| traversal.visit_with(db, *element, &mut *predicate)),
+            Type::Intersection(intersection) => intersection
+                .positive(db)
+                .iter()
+                .any(|element| traversal.visit_with(db, *element, &mut *predicate)),
+            _ => false,
+        }
     }
 }
 
@@ -740,11 +769,68 @@ fn definite_match_pattern_type_for_subject_cached<'pattern, 'db>(
         return *result;
     }
 
-    let result = definite_match_pattern_type_for_subject_impl(db, env, kind, subject_ty, cache);
+    let result =
+        if let Some(independent) = subject_independent_definite_match_pattern_type(db, env, kind) {
+            independent
+        } else {
+            TypeTraversal::new(env, DefinitePattern(kind)).visit_with(
+                db,
+                subject_ty,
+                (&mut *cache, subject_ty),
+            )
+        };
     if cacheable {
         cache.insert(key, result);
     }
     result
+}
+
+/// One traversal inspects a fixed pattern. Nested patterns start their own traversal, so a
+/// finite nested pattern can inspect successive occurrences of the same recursive type.
+struct DefinitePattern<'pattern, 'db>(&'pattern PatternPredicateKind<'db>);
+
+impl<'a, 'pattern, 'db> TypeOperation<'db, (&'a mut PatternTypeCache<'pattern, 'db>, Type<'db>)>
+    for DefinitePattern<'pattern, 'db>
+{
+    type Output = Type<'db>;
+
+    fn on_cycle(
+        &self,
+        _traversal: &TypeTraversal<'_, 'db, Self>,
+        _ty: Type<'db>,
+        _kind: CycleKind,
+        _state: (&'a mut PatternTypeCache<'pattern, 'db>, Type<'db>),
+    ) -> Type<'db> {
+        Type::Never
+    }
+
+    fn visit(
+        &self,
+        db: &'db dyn Db,
+        traversal: &TypeTraversal<'_, 'db, Self>,
+        resolved_subject_ty: Type<'db>,
+        (cache, subject_ty): (&'a mut PatternTypeCache<'pattern, 'db>, Type<'db>),
+    ) -> Type<'db> {
+        let env = traversal.environment();
+        if let Type::Union(union) = resolved_subject_ty {
+            return UnionType::from_elements(
+                db,
+                env,
+                union
+                    .elements(db)
+                    .iter()
+                    .map(|element| traversal.visit_with(db, *element, (&mut *cache, *element))),
+            );
+        }
+        definite_match_pattern_type_for_subject_impl(
+            db,
+            env,
+            self.0,
+            subject_ty,
+            resolved_subject_ty,
+            cache,
+        )
+    }
 }
 
 fn definite_match_pattern_type_for_subject_impl<'pattern, 'db>(
@@ -752,25 +838,9 @@ fn definite_match_pattern_type_for_subject_impl<'pattern, 'db>(
     env: &ProgramEnvironment<'db>,
     kind: &'pattern PatternPredicateKind<'db>,
     subject_ty: Type<'db>,
+    resolved_subject_ty: Type<'db>,
     cache: &mut PatternTypeCache<'pattern, 'db>,
 ) -> Type<'db> {
-    if let Some(subject_independent_ty) =
-        subject_independent_definite_match_pattern_type(db, env, kind)
-    {
-        return subject_independent_ty;
-    }
-
-    let resolved_subject_ty = subject_ty.resolve_type_alias(db);
-    if let Type::Union(union) = resolved_subject_ty {
-        return UnionType::from_elements(
-            db,
-            env,
-            union.elements(db).iter().map(|element| {
-                definite_match_pattern_type_for_subject_cached(db, env, kind, *element, cache)
-            }),
-        );
-    }
-
     match kind {
         PatternPredicateKind::Value(value) => {
             let value_ty = infer_same_file_expression_type(db, *value, TypeContext::default());
@@ -1032,67 +1102,103 @@ fn try_sequence_pattern_binding_fallthrough_type<'db>(
     subject_ty: Type<'db>,
     budget: &mut ExactTuplePatternExpansionBudget,
 ) -> Result<Type<'db>, ()> {
-    let resolved = subject_ty.resolve_type_alias(db);
-    let narrowed = match resolved {
-        Type::Union(union) => union
-            .try_map(db, env, |element| {
-                try_sequence_pattern_binding_fallthrough_type(db, env, kind, *element, budget).ok()
-            })
-            .ok_or(())?,
-        Type::Intersection(intersection) => {
-            let mut failed = false;
-            let narrowed = intersection.map_positive(db, env, |element| {
-                try_sequence_pattern_binding_fallthrough_type(db, env, kind, *element, budget)
-                    .unwrap_or_else(|()| {
-                        failed = true;
-                        *element
-                    })
-            });
-            if failed {
-                return Err(());
-            }
-            narrowed
-        }
-        Type::TypeVar(typevar)
-            if typevar
-                .typevar(db)
-                .upper_bound(db, env)
-                .is_some_and(|bound| {
-                    pattern_fallthrough_type(
-                        db,
-                        env,
-                        &PatternPredicateKind::Sequence(kind.clone()),
-                        bound,
-                    )
-                    .is_never()
-                }) =>
-        {
-            Type::Never
-        }
-        _ if resolved.exact_tuple_instance_spec(db).is_some() => {
-            exact_tuple_sequence_pattern_fallthrough_type(db, env, kind, resolved, budget)?
-                .unwrap_or_else(|| {
-                    pattern_fallthrough_type(
-                        db,
-                        env,
-                        &PatternPredicateKind::Sequence(kind.clone()),
-                        resolved,
-                    )
-                })
-        }
-        // An irrefutable sequence pattern can only fail if the subject is not eligible for sequence
-        // matching. Unlike length and indexed-element facts, eligibility is unaffected by mutation.
-        _ if kind.is_irrefutable() => IntersectionBuilder::new(db, env)
-            .add_positive(resolved)
-            .add_negative(sequence_pattern_type_builder(db, env).build())
-            .build(),
-        _ => resolved,
-    };
+    TypeTraversal::new(env, SequencePatternFallthrough(kind)).visit_with(
+        db,
+        subject_ty,
+        (budget, subject_ty),
+    )
+}
 
-    if narrowed == resolved {
-        Ok(subject_ty)
-    } else {
-        Ok(narrowed)
+struct SequencePatternFallthrough<'pattern, 'db>(&'pattern SequencePatternPredicateKind<'db>);
+
+impl<'a, 'db> TypeOperation<'db, (&'a mut ExactTuplePatternExpansionBudget, Type<'db>)>
+    for SequencePatternFallthrough<'_, 'db>
+{
+    type Output = Result<Type<'db>, ()>;
+
+    fn on_cycle(
+        &self,
+        _traversal: &TypeTraversal<'_, 'db, Self>,
+        _ty: Type<'db>,
+        _kind: CycleKind,
+        _state: (&'a mut ExactTuplePatternExpansionBudget, Type<'db>),
+    ) -> Self::Output {
+        Err(())
+    }
+
+    fn visit(
+        &self,
+        db: &'db dyn Db,
+        traversal: &TypeTraversal<'_, 'db, Self>,
+        resolved: Type<'db>,
+        (budget, subject_ty): (&'a mut ExactTuplePatternExpansionBudget, Type<'db>),
+    ) -> Self::Output {
+        let env = traversal.environment();
+        let kind = self.0;
+        let narrowed = match resolved {
+            Type::Union(union) => union
+                .try_map(db, env, |element| {
+                    traversal
+                        .visit_with(db, *element, (&mut *budget, *element))
+                        .ok()
+                })
+                .ok_or(())?,
+            Type::Intersection(intersection) => {
+                let mut failed = false;
+                let narrowed = intersection.map_positive(db, env, |element| {
+                    traversal
+                        .visit_with(db, *element, (&mut *budget, *element))
+                        .unwrap_or_else(|()| {
+                            failed = true;
+                            *element
+                        })
+                });
+                if failed {
+                    return Err(());
+                }
+                narrowed
+            }
+            Type::TypeVar(typevar)
+                if typevar
+                    .typevar(db)
+                    .upper_bound(db, env)
+                    .is_some_and(|bound| {
+                        pattern_fallthrough_type(
+                            db,
+                            env,
+                            &PatternPredicateKind::Sequence(kind.clone()),
+                            bound,
+                        )
+                        .is_never()
+                    }) =>
+            {
+                Type::Never
+            }
+            _ if resolved.exact_tuple_instance_spec(db).is_some() => {
+                exact_tuple_sequence_pattern_fallthrough_type(db, env, kind, resolved, budget)?
+                    .unwrap_or_else(|| {
+                        pattern_fallthrough_type(
+                            db,
+                            env,
+                            &PatternPredicateKind::Sequence(kind.clone()),
+                            resolved,
+                        )
+                    })
+            }
+            // An irrefutable sequence pattern can only fail if the subject is not eligible for sequence
+            // matching. Unlike length and indexed-element facts, eligibility is unaffected by mutation.
+            _ if kind.is_irrefutable() => IntersectionBuilder::new(db, env)
+                .add_positive(resolved)
+                .add_negative(sequence_pattern_type_builder(db, env).build())
+                .build(),
+            _ => resolved,
+        };
+
+        if narrowed == resolved {
+            Ok(subject_ty)
+        } else {
+            Ok(narrowed)
+        }
     }
 }
 
@@ -1183,24 +1289,52 @@ fn is_same_enum_pattern_domain<'db>(
     ty: Type<'db>,
     right: EnumLiteralType<'db>,
 ) -> bool {
-    if is_same_enum_domain(db, env, ty, right) {
-        return true;
+    TypeTraversal::new(env, EnumPatternDomain(right)).visit(db, ty)
+}
+
+struct EnumPatternDomain<'db>(EnumLiteralType<'db>);
+
+impl<'db> TypeOperation<'db> for EnumPatternDomain<'db> {
+    type Output = bool;
+
+    fn on_cycle(
+        &self,
+        _traversal: &TypeTraversal<'_, 'db, Self>,
+        _ty: Type<'db>,
+        kind: CycleKind,
+        _state: (),
+    ) -> bool {
+        kind == CycleKind::Exact
     }
 
-    match ty.resolve_type_alias(db) {
-        Type::TypeVar(typevar) => typevar
-            .typevar(db)
-            .upper_bound(db, env)
-            .is_some_and(|bound| is_same_enum_domain(db, env, bound, right)),
-        Type::Union(union) => union
-            .elements(db)
-            .iter()
-            .all(|element| is_same_enum_pattern_domain(db, env, *element, right)),
-        Type::Intersection(intersection) => intersection
-            .positive(db)
-            .iter()
-            .any(|element| is_same_enum_pattern_domain(db, env, *element, right)),
-        _ => false,
+    fn visit(
+        &self,
+        db: &'db dyn Db,
+        traversal: &TypeTraversal<'_, 'db, Self>,
+        ty: Type<'db>,
+        _state: (),
+    ) -> bool {
+        let env = traversal.environment();
+        let right = self.0;
+        if is_same_enum_domain(db, env, ty, right) {
+            return true;
+        }
+
+        match ty {
+            Type::TypeVar(typevar) => typevar
+                .typevar(db)
+                .upper_bound(db, env)
+                .is_some_and(|bound| is_same_enum_domain(db, env, bound, right)),
+            Type::Union(union) => union
+                .elements(db)
+                .iter()
+                .all(|element| traversal.visit(db, *element)),
+            Type::Intersection(intersection) => intersection
+                .positive(db)
+                .iter()
+                .any(|element| traversal.visit(db, *element)),
+            _ => false,
+        }
     }
 }
 

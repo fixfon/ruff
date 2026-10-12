@@ -38,10 +38,11 @@ use crate::types::visitor::{
 };
 use crate::types::{
     ApplyTypeMappingVisitor, BindingContext, BoundTypeVarInstance, CallableType, CallableTypes,
-    ClassLiteral, ErrorContext, FindLegacyTypeVarsVisitor, IntersectionType, KnownClass,
+    ClassLiteral, CycleKind, ErrorContext, FindLegacyTypeVarsVisitor, IntersectionType, KnownClass,
     KnownInstanceType, MaterializationKind, RecursiveType, SubclassOfInner, Type, TypeAliasType,
-    TypeContext, TypeMapping, TypeVarBoundOrConstraints, TypeVarKind, TypeVarVariance,
-    UnionAccumulator, UnionType, binding_type, infer_definition_types, inferred_declaration,
+    TypeContext, TypeMapping, TypeOperation, TypeTraversal, TypeVarBoundOrConstraints, TypeVarKind,
+    TypeVarVariance, UnionAccumulator, UnionType, binding_type, infer_definition_types,
+    inferred_declaration,
 };
 use crate::{Db, FxIndexMap, FxOrderMap, FxOrderSet};
 use ty_python_core::definition::{Definition, DefinitionKind};
@@ -3701,113 +3702,114 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                 })
         }
 
-        fn collect_typed_dicts<'db>(
-            db: &'db dyn Db,
-            env: &ProgramEnvironment<'db>,
-            ty: Type<'db>,
-            resolving: &mut FxHashSet<Type<'db>>,
-            completed: &mut FxHashMap<Type<'db>, bool>,
-            typed_dicts: &mut FxHashSet<Type<'db>>,
-            other_types: &mut FxOrderSet<Type<'db>>,
-        ) -> bool {
-            let ty = ty.resolve_type_alias(db);
-            if let Some(result) = completed.get(&ty) {
-                return *result;
+        #[derive(Default)]
+        struct MappingUnionTypes<'db> {
+            completed: FxHashMap<Type<'db>, bool>,
+            typed_dicts: FxHashSet<Type<'db>>,
+            other_types: FxOrderSet<Type<'db>>,
+        }
+
+        struct CollectMappingUnionTypes;
+
+        impl<'a, 'db> TypeOperation<'db, &'a mut MappingUnionTypes<'db>> for CollectMappingUnionTypes {
+            type Output = bool;
+
+            fn on_cycle(
+                &self,
+                _traversal: &TypeTraversal<'_, 'db, Self>,
+                _ty: Type<'db>,
+                _kind: CycleKind,
+                _types: &'a mut MappingUnionTypes<'db>,
+            ) -> bool {
+                false
             }
 
-            let result = match ty {
-                Type::TypedDict(_) => {
-                    typed_dicts.insert(ty);
-                    true
+            fn visit(
+                &self,
+                db: &'db dyn Db,
+                traversal: &TypeTraversal<'_, 'db, Self>,
+                ty: Type<'db>,
+                types: &'a mut MappingUnionTypes<'db>,
+            ) -> bool {
+                let env = traversal.environment();
+                if let Some(result) = types.completed.get(&ty) {
+                    return *result;
                 }
-                Type::Union(union) => {
-                    if !resolving.insert(ty) {
-                        return false;
+                let result = match ty {
+                    Type::TypedDict(_) => {
+                        types.typed_dicts.insert(ty);
+                        true
                     }
-                    let result = union.elements(db).iter().all(|element| {
-                        collect_typed_dicts(
-                            db,
-                            env,
-                            *element,
-                            resolving,
-                            completed,
-                            typed_dicts,
-                            other_types,
-                        )
-                    });
-                    resolving.remove(&ty);
-                    result
-                }
-                Type::Intersection(intersection)
-                    if intersection.negative(db).is_empty()
-                        && intersection
-                            .iter_positive(db)
-                            .any(|element| element.resolve_type_alias(db).is_typed_dict())
-                        && intersection.iter_positive(db).all(|element| {
-                            let element = element.resolve_type_alias(db);
-                            element.is_typed_dict()
-                                || element
-                                    == KnownClass::Dict
-                                        .to_instance_unknown(db, env)
-                                        .top_materialization(db, env)
-                        }) =>
-                {
-                    // `isinstance(value, dict)` narrows a `TypedDict` to an intersection with
-                    // `Top[dict[Unknown, Unknown]]`. Other conjuncts may contribute gradual
-                    // constraints that the shared mapping would erase.
-                    typed_dicts.insert(ty);
-                    true
-                }
-                Type::Intersection(intersection)
-                    if intersection.negative(db).is_empty()
-                        && intersection
-                            .iter_positive(db)
-                            .any(|element| is_string_keyed_mapping(db, env, element))
-                        && intersection.iter_positive(db).all(|element| {
-                            let element = element.resolve_type_alias(db);
-                            is_string_keyed_mapping(db, env, element)
-                                || element
-                                    == KnownClass::Dict
-                                        .to_instance_unknown(db, env)
-                                        .top_materialization(db, env)
-                        }) =>
-                {
-                    // `isinstance(value, dict)` can also narrow a mapping to an intersection with
-                    // `Top[dict[Unknown, Unknown]]`. Retain the full intersection so its original
-                    // key and value constraints are preserved.
-                    other_types.insert(ty);
-                    true
-                }
-                Type::NominalInstance(_) if is_string_keyed_mapping(db, env, ty) => {
-                    other_types.insert(ty);
-                    true
-                }
-                _ => false,
-            };
-            completed.insert(ty, result);
-            result
+                    Type::Union(union) => union
+                        .elements(db)
+                        .iter()
+                        .all(|element| traversal.visit_with(db, *element, &mut *types)),
+                    Type::Intersection(intersection)
+                        if intersection.negative(db).is_empty()
+                            && intersection
+                                .iter_positive(db)
+                                .any(|element| element.resolve_type_alias(db).is_typed_dict())
+                            && intersection.iter_positive(db).all(|element| {
+                                let element = element.resolve_type_alias(db);
+                                element.is_typed_dict()
+                                    || element
+                                        == KnownClass::Dict
+                                            .to_instance_unknown(db, env)
+                                            .top_materialization(db, env)
+                            }) =>
+                    {
+                        // `isinstance(value, dict)` narrows a `TypedDict` to an intersection with
+                        // `Top[dict[Unknown, Unknown]]`. Other conjuncts may contribute gradual
+                        // constraints that the shared mapping would erase.
+                        types.typed_dicts.insert(ty);
+                        true
+                    }
+                    Type::Intersection(intersection)
+                        if intersection.negative(db).is_empty()
+                            && intersection
+                                .iter_positive(db)
+                                .any(|element| is_string_keyed_mapping(db, env, element))
+                            && intersection.iter_positive(db).all(|element| {
+                                let element = element.resolve_type_alias(db);
+                                is_string_keyed_mapping(db, env, element)
+                                    || element
+                                        == KnownClass::Dict
+                                            .to_instance_unknown(db, env)
+                                            .top_materialization(db, env)
+                            }) =>
+                    {
+                        // `isinstance(value, dict)` can also narrow a mapping to an intersection with
+                        // `Top[dict[Unknown, Unknown]]`. Retain the full intersection so its original
+                        // key and value constraints are preserved.
+                        types.other_types.insert(ty);
+                        true
+                    }
+                    Type::NominalInstance(_) if is_string_keyed_mapping(db, env, ty) => {
+                        types.other_types.insert(ty);
+                        true
+                    }
+                    _ => false,
+                };
+                types.completed.insert(ty, result);
+                result
+            }
         }
         let db = self.db;
 
-        let mut resolving = FxHashSet::default();
-        let mut completed = FxHashMap::default();
-        let mut typed_dicts = FxHashSet::default();
-        let mut other_types = FxOrderSet::default();
         let env = self.env;
-
-        if !actual.elements(db).iter().all(|element| {
-            collect_typed_dicts(
-                db,
-                env,
-                *element,
-                &mut resolving,
-                &mut completed,
-                &mut typed_dicts,
-                &mut other_types,
-            )
-        }) {
+        let mut types = MappingUnionTypes::default();
+        if !TypeTraversal::new(env, CollectMappingUnionTypes).visit_with(
+            db,
+            Type::Union(actual),
+            &mut types,
+        ) {
             return None;
         }
+        let MappingUnionTypes {
+            typed_dicts,
+            other_types,
+            ..
+        } = types;
         if typed_dicts.is_empty() {
             return None;
         }

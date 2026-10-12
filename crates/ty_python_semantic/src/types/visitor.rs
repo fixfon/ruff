@@ -728,7 +728,7 @@ pub(super) fn contains_growing_type<'db>(
                 && matches!(
                     ty.to_type_identity(db),
                     TypeIdentity::GrowingTypeAlias(_)
-                        | TypeIdentity::GrowingRecursive(_)
+                        | TypeIdentity::GrowingRecursive { .. }
                         | TypeIdentity::GrowingProtocol(_)
                         | TypeIdentity::GrowingTypedDict(_)
                 )

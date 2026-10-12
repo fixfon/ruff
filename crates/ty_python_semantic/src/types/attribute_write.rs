@@ -8,7 +8,7 @@
 //! relation and constraint set.
 
 use crate::Db;
-use crate::types::ApplyTypeMappingVisitor;
+use crate::types::{CycleKind, TypeOperation, TypeTraversal};
 use ty_module_resolver::KnownModule;
 use ty_python_core::{definition::Definition, use_def_map};
 
@@ -38,12 +38,12 @@ pub(super) enum AttributeWriteRequirement<'db> {
     /// A write to a union must be valid for every union element.
     All {
         object_ty: Type<'db>,
-        element_tys: &'db [Type<'db>],
+        requirements: Box<[AttributeWriteRequirement<'db>]>,
     },
     /// A write to an intersection may target any positive intersection element.
     Any {
         object_ty: Type<'db>,
-        intersection: IntersectionType<'db>,
+        requirements: Box<[AttributeWriteRequirement<'db>]>,
     },
     /// A value may be assigned without an attribute-specific constraint.
     Unconstrained,
@@ -292,115 +292,155 @@ pub(super) fn attribute_write_requirement<'db>(
     object_ty: Type<'db>,
     attribute: &str,
 ) -> AttributeWriteRequirement<'db> {
-    match object_ty {
-        Type::RecursiveVar(_) => {
-            unreachable!("semantic operation on an unbound recursive variable")
-        }
-        Type::Union(union) => AttributeWriteRequirement::All {
-            object_ty,
-            element_tys: union.elements(db),
-        },
+    TypeTraversal::new(env, ResolveAttributeWrite(attribute))
+        .visit(db, object_ty)
+        .unwrap_or(AttributeWriteRequirement::Unconstrained)
+}
 
-        Type::Intersection(intersection) => {
-            // TODO: Handle negative intersection elements.
-            AttributeWriteRequirement::Any {
-                object_ty,
-                intersection,
+struct ResolveAttributeWrite<'a>(&'a str);
+
+impl<'db> TypeOperation<'db> for ResolveAttributeWrite<'_> {
+    type Output = Option<AttributeWriteRequirement<'db>>;
+
+    fn on_cycle(
+        &self,
+        _traversal: &TypeTraversal<'_, 'db, Self>,
+        _ty: Type<'db>,
+        kind: CycleKind,
+        _state: (),
+    ) -> Self::Output {
+        match kind {
+            CycleKind::Exact => None,
+            CycleKind::MatchingIdentity => Some(AttributeWriteRequirement::CannotAssign),
+        }
+    }
+
+    fn visit(
+        &self,
+        db: &'db dyn Db,
+        traversal: &TypeTraversal<'_, 'db, Self>,
+        object_ty: Type<'db>,
+        _state: (),
+    ) -> Self::Output {
+        let env = traversal.environment();
+        let attribute = self.0;
+        Some(match object_ty {
+            Type::RecursiveVar(_) => {
+                unreachable!("semantic operation on an unbound recursive variable")
             }
-        }
+            Type::Union(union) => {
+                let mut requirements: Vec<_> = union
+                    .elements(db)
+                    .iter()
+                    .filter_map(|element| traversal.visit(db, *element))
+                    .collect();
+                return match requirements.len() {
+                    0 => None,
+                    1 => requirements.pop(),
+                    _ => Some(AttributeWriteRequirement::All {
+                        object_ty,
+                        requirements: requirements.into_boxed_slice(),
+                    }),
+                };
+            }
+            Type::Intersection(intersection) => {
+                // TODO: Handle negative intersection elements.
+                let requirements: Vec<_> = intersection
+                    .positive(db)
+                    .iter()
+                    .filter_map(|element| traversal.visit(db, *element))
+                    .collect();
+                return match requirements.len() {
+                    0 if !intersection.positive(db).is_empty() => None,
+                    _ => Some(AttributeWriteRequirement::Any {
+                        object_ty,
+                        requirements: requirements.into_boxed_slice(),
+                    }),
+                };
+            }
+            Type::EnumComplement(complement) => {
+                return traversal.visit(db, complement.remaining_literal_union(db, env));
+            }
+            Type::Recursive(_) | Type::TypeAlias(_) => AttributeWriteRequirement::Unconstrained,
 
-        Type::EnumComplement(complement) => attribute_write_requirement(
-            db,
-            env,
-            complement.remaining_literal_union(db, env),
-            attribute,
-        ),
+            Type::NominalInstance(instance) if instance.has_known_class(db, KnownClass::Super) => {
+                AttributeWriteRequirement::CannotAssign
+            }
+            Type::BoundSuper(_) => AttributeWriteRequirement::CannotAssign,
 
-        Type::TypeAlias(alias) => {
-            attribute_write_requirement(db, env, alias.value_type(db), attribute)
-        }
-        Type::Recursive(recursive) => recursive
-            .unfold(db, &ApplyTypeMappingVisitor::new(env))
-            .map(|unfolded| attribute_write_requirement(db, env, unfolded, attribute))
-            .unwrap_or(AttributeWriteRequirement::Unconstrained),
+            Type::Dynamic(..) | Type::Divergent(_) | Type::Never => {
+                AttributeWriteRequirement::Unconstrained
+            }
 
-        Type::NominalInstance(instance) if instance.has_known_class(db, KnownClass::Super) => {
-            AttributeWriteRequirement::CannotAssign
-        }
-        Type::BoundSuper(_) => AttributeWriteRequirement::CannotAssign,
+            Type::ProtocolInstance(protocol) => protocol
+                .interface(db)
+                .instance_write_requirement(db, env, object_ty, attribute)
+                .map_or_else(
+                    || instance_attribute_write_requirement(db, env, object_ty, attribute),
+                    |(write, qualifiers)| AttributeWriteRequirement::ProtocolMember {
+                        receiver_ty: object_ty,
+                        write,
+                        qualifiers,
+                    },
+                ),
 
-        Type::Dynamic(..) | Type::Divergent(_) | Type::Never => {
-            AttributeWriteRequirement::Unconstrained
-        }
+            Type::NominalInstance(..)
+            | Type::LiteralValue(..)
+            | Type::SpecialForm(..)
+            | Type::KnownInstance(..)
+            | Type::PropertyInstance(..)
+            | Type::SlotDescriptor(..)
+            | Type::FunctionLiteral(..)
+            | Type::Callable(..)
+            | Type::BoundMethod(_)
+            | Type::KnownBoundMethod(_)
+            | Type::WrapperDescriptor(_)
+            | Type::DataclassDecorator(_)
+            | Type::DataclassTransformer(_)
+            | Type::TypeVar(..)
+            | Type::AlwaysTruthy
+            | Type::AlwaysFalsy
+            | Type::TypeIs(_)
+            | Type::TypeGuard(_)
+            | Type::TypeForm(_)
+            | Type::TypedDict(_)
+            | Type::NewTypeInstance(_) => {
+                instance_attribute_write_requirement(db, env, object_ty, attribute)
+            }
 
-        Type::ProtocolInstance(protocol) => protocol
-            .interface(db)
-            .instance_write_requirement(db, env, object_ty, attribute)
-            .map_or_else(
-                || instance_attribute_write_requirement(db, env, object_ty, attribute),
-                |(write, qualifiers)| AttributeWriteRequirement::ProtocolMember {
-                    receiver_ty: object_ty,
-                    write,
-                    qualifiers,
-                },
-            ),
+            Type::SubclassOf(subclass_of) => subclass_of
+                .meta_write_requirement(db, env, attribute)
+                .map_or_else(
+                    || class_attribute_write_requirement(db, env, object_ty, attribute),
+                    |(write_ty, qualifiers)| AttributeWriteRequirement::ProtocolMember {
+                        receiver_ty: object_ty,
+                        write: write_ty.map(ProtocolMemberWriteRequirement::AssignableTo),
+                        qualifiers,
+                    },
+                ),
 
-        Type::NominalInstance(..)
-        | Type::LiteralValue(..)
-        | Type::SpecialForm(..)
-        | Type::KnownInstance(..)
-        | Type::PropertyInstance(..)
-        | Type::SlotDescriptor(..)
-        | Type::FunctionLiteral(..)
-        | Type::Callable(..)
-        | Type::BoundMethod(_)
-        | Type::KnownBoundMethod(_)
-        | Type::WrapperDescriptor(_)
-        | Type::DataclassDecorator(_)
-        | Type::DataclassTransformer(_)
-        | Type::TypeVar(..)
-        | Type::AlwaysTruthy
-        | Type::AlwaysFalsy
-        | Type::TypeIs(_)
-        | Type::TypeGuard(_)
-        | Type::TypeForm(_)
-        | Type::TypedDict(_)
-        | Type::NewTypeInstance(_) => {
-            instance_attribute_write_requirement(db, env, object_ty, attribute)
-        }
+            Type::ClassLiteral(..) | Type::GenericAlias(..) => {
+                class_attribute_write_requirement(db, env, object_ty, attribute)
+            }
 
-        Type::SubclassOf(subclass_of) => subclass_of
-            .meta_write_requirement(db, env, attribute)
-            .map_or_else(
-                || class_attribute_write_requirement(db, env, object_ty, attribute),
-                |(write_ty, qualifiers)| AttributeWriteRequirement::ProtocolMember {
-                    receiver_ty: object_ty,
-                    write: write_ty.map(ProtocolMemberWriteRequirement::AssignableTo),
-                    qualifiers,
-                },
-            ),
-
-        Type::ClassLiteral(..) | Type::GenericAlias(..) => {
-            class_attribute_write_requirement(db, env, object_ty, attribute)
-        }
-
-        Type::ModuleLiteral(module) => {
-            let resolved_module = module.module(db);
-            let symbol = if resolved_module
-                .known(db)
-                .is_some_and(KnownModule::is_builtins)
-            {
-                builtins_symbol(db, env, attribute)
-            } else {
-                module
-                    .static_member(db, env, attribute)
-                    .map_or_else(|_| Place::Undefined.into(), |member| member.member(db))
-            };
-            AttributeWriteRequirement::Module(match symbol.place {
-                Place::Defined(DefinedPlace { ty, .. }) => Some(ty),
-                Place::Undefined => None,
-            })
-        }
+            Type::ModuleLiteral(module) => {
+                let resolved_module = module.module(db);
+                let symbol = if resolved_module
+                    .known(db)
+                    .is_some_and(KnownModule::is_builtins)
+                {
+                    builtins_symbol(db, env, attribute)
+                } else {
+                    module
+                        .static_member(db, env, attribute)
+                        .map_or_else(|_| Place::Undefined.into(), |member| member.member(db))
+                };
+                AttributeWriteRequirement::Module(match symbol.place {
+                    Place::Defined(DefinedPlace { ty, .. }) => Some(ty),
+                    Place::Undefined => None,
+                })
+            }
+        })
     }
 }
 
@@ -1260,15 +1300,12 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
         value_ty: Type<'db>,
     ) -> ConstraintSet<'db, 'c> {
         match requirement {
-            AttributeWriteRequirement::All { element_tys, .. } => {
-                let env = self.env;
+            AttributeWriteRequirement::All { requirements, .. } => {
                 let mut result = self.always();
-                for element_ty in *element_tys {
-                    let requirement =
-                        attribute_write_requirement(db, env, *element_ty, member_name);
+                for requirement in requirements {
                     let element_result = self.check_attribute_write_requirement(
                         db,
-                        &requirement,
+                        requirement,
                         member_name,
                         value_ty,
                     );
@@ -1279,15 +1316,12 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                 }
                 result
             }
-            AttributeWriteRequirement::Any { intersection, .. } => {
-                let env = self.env;
+            AttributeWriteRequirement::Any { requirements, .. } => {
                 let mut result = self.never();
-                for element_ty in intersection.positive(db) {
-                    let requirement =
-                        attribute_write_requirement(db, env, *element_ty, member_name);
+                for requirement in requirements {
                     let element_result = self.check_attribute_write_requirement(
                         db,
-                        &requirement,
+                        requirement,
                         member_name,
                         value_ty,
                     );

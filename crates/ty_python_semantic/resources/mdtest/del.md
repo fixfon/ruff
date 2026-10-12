@@ -342,6 +342,24 @@ del SupportsClassDelete.x
 del RejectsClassDelete.x
 ```
 
+### Recursive value types
+
+Deleting an attribute still checks the concrete alternatives of a recursive value type:
+
+```py
+from typing import cast
+from typing_extensions import TypedDict
+from ty_extensions._internal import TypeOf
+
+class Node(TypedDict, closed=True):
+    leaf: int
+    child: TypeOf[next(iter(cast("Node", {}).values()))]
+
+def delete(node: Node):
+    value = next(iter(node.values()))
+    del value.child  # error: [unresolved-attribute]
+```
+
 ## Delete items
 
 ### Basic item deletion

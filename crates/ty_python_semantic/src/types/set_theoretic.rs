@@ -2,6 +2,7 @@ use crate::ProgramEnvironment;
 use itertools::Either;
 use rustc_hash::FxHashSet;
 
+use std::cell::{Cell, RefCell};
 use std::convert::Infallible;
 
 use crate::place::{
@@ -10,8 +11,9 @@ use crate::place::{
 use crate::types::class::KnownClass;
 use crate::types::enums::EnumComplement;
 use crate::types::{
-    ApplyTypeMappingVisitor, InstanceProjection, PromotionKind, PromotionMode, Type, TypeContext,
-    TypeMapping, TypePair, TypeQualifiers,
+    ApplyTypeMappingVisitor, CycleKind, InstanceProjection, ProjectInstance, PromotionKind,
+    PromotionMode, Type, TypeContext, TypeMapping, TypeOperation, TypePair, TypeQualifiers,
+    TypeTraversal,
 };
 use crate::types::{TypeVarBoundOrConstraints, visitor};
 use crate::{Db, FxOrderSet};
@@ -20,6 +22,135 @@ pub(crate) mod builder;
 mod generic_gradual_intersections;
 
 pub(crate) use builder::{IntersectionBuilder, UnionBuilder};
+
+struct ExpandUnion<'a, 'db> {
+    seen: RefCell<FxHashSet<Type<'db>>>,
+    recursively_defined: &'a Cell<RecursivelyDefined>,
+    unpack_aliases: bool,
+    cycle_recovery: bool,
+    expand_named: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+struct UnionExpansionState {
+    unfold_named: bool,
+    inside_alias: bool,
+}
+
+impl<'db> TypeOperation<'db, UnionExpansionState> for ExpandUnion<'_, 'db> {
+    type Output = Result<Vec<Type<'db>>, ()>;
+
+    fn on_cycle(
+        &self,
+        _traversal: &TypeTraversal<'_, 'db, Self>,
+        _ty: Type<'db>,
+        kind: CycleKind,
+        _state: UnionExpansionState,
+    ) -> Self::Output {
+        match kind {
+            CycleKind::Exact => Ok(Vec::new()),
+            CycleKind::MatchingIdentity => Err(()),
+        }
+    }
+
+    fn visit_alias_like(
+        &self,
+        db: &'db dyn Db,
+        _traversal: &TypeTraversal<'_, 'db, Self>,
+        ty: Type<'db>,
+        state: UnionExpansionState,
+        visit_body: impl FnOnce(UnionExpansionState) -> Self::Output,
+    ) -> Self::Output {
+        if !self.seen.borrow_mut().insert(ty) {
+            return Ok(Vec::new());
+        }
+        let unfold = match ty {
+            Type::TypeAlias(_) => self.unpack_aliases,
+            Type::Recursive(recursive) => {
+                self.expand_named
+                    || state.unfold_named
+                    || ((self.unpack_aliases || self.cycle_recovery)
+                        && recursive.alias(db).is_none())
+            }
+            _ => false,
+        };
+        if !unfold {
+            return Ok(vec![ty]);
+        }
+
+        let result = visit_body(UnionExpansionState {
+            unfold_named: state.unfold_named || matches!(ty, Type::TypeAlias(_)),
+            inside_alias: true,
+        });
+        // Retain the outer constructor when any part of its expansion grows. Retaining only
+        // an inner constructor would expose another layer of mutual recursion on each pass.
+        if state.inside_alias {
+            result
+        } else {
+            Ok(result.unwrap_or_else(|()| vec![ty]))
+        }
+    }
+
+    fn visit(
+        &self,
+        db: &'db dyn Db,
+        traversal: &TypeTraversal<'_, 'db, Self>,
+        ty: Type<'db>,
+        state: UnionExpansionState,
+    ) -> Self::Output {
+        match ty {
+            Type::Union(union) => {
+                if !self.seen.borrow_mut().insert(ty) {
+                    return Ok(Vec::new());
+                }
+                self.recursively_defined.set(
+                    self.recursively_defined
+                        .get()
+                        .or(union.recursively_defined(db)),
+                );
+                let mut elements = Vec::new();
+                for element in union.elements(db) {
+                    elements.extend(traversal.visit_with(
+                        db,
+                        *element,
+                        UnionExpansionState {
+                            unfold_named: false,
+                            ..state
+                        },
+                    )?);
+                }
+                Ok(elements)
+            }
+            Type::Never => Ok(Vec::new()),
+            ty => Ok(vec![ty]),
+        }
+    }
+}
+
+/// Expand only outer aliases and unions, preserving a constructor when specialization grows.
+fn expand_union_elements<'db>(
+    db: &'db dyn Db,
+    ty: Type<'db>,
+    visitor: &ApplyTypeMappingVisitor<'_, 'db>,
+    unpack_aliases: bool,
+    cycle_recovery: bool,
+    unfold_named: bool,
+) -> (Vec<Type<'db>>, RecursivelyDefined) {
+    let recursively_defined = Cell::new(RecursivelyDefined::No);
+    let elements = TypeTraversal::from_mapping_visitor(
+        visitor,
+        ExpandUnion {
+            seen: RefCell::default(),
+            recursively_defined: &recursively_defined,
+            unpack_aliases,
+            cycle_recovery,
+            expand_named: unfold_named,
+        },
+    )
+    .visit_with(db, ty, UnionExpansionState::default())
+    .unwrap_or_else(|()| vec![ty]);
+    (elements, recursively_defined.get())
+}
 
 #[salsa::interned(debug, heap_size=ruff_memory_usage::heap_size)]
 pub struct UnionType<'db> {
@@ -161,6 +292,19 @@ impl<'db> UnionType<'db> {
         self.elements(db).iter().copied().any(Type::is_alias_like)
     }
 
+    /// Whether this union still needs expansion in the current type operation.
+    ///
+    /// A completed expansion can retain recursive references. Those references are compared
+    /// individually; expanding the whole union again would expose ever larger specializations.
+    pub(super) fn needs_alias_expansion(
+        self,
+        db: &'db dyn Db,
+        visitor: &ApplyTypeMappingVisitor<'_, 'db>,
+    ) -> bool {
+        self.has_aliases(db)
+            && visitor.expanded_unions.borrow().get(&self) != Some(&Type::Union(self))
+    }
+
     /// Recursively expands aliases that expose top-level union elements.
     ///
     /// Aliases nested inside non-union elements remain part of those elements.
@@ -174,31 +318,24 @@ impl<'db> UnionType<'db> {
         if let Some(expanded) = visitor.expanded_unions.borrow().get(&self) {
             return *expanded;
         }
-        // Expose both alias forms without expanding aliases inside containers during reduction.
-        let mut builder = UnionBuilder::new(db, visitor.env).unpack_aliases(false);
-        let mut pending = vec![Type::Union(self)];
-        let mut seen = FxHashSet::default();
-        while let Some(element) = pending.pop() {
-            if !seen.insert(element) {
-                continue;
-            }
-            match element {
-                Type::Union(union) => pending.extend(union.elements(db).iter().rev().copied()),
-                Type::TypeAlias(alias) => {
-                    pending.push(alias.value_type_with_recursion(db, visitor.recursion_context));
-                }
-                Type::Recursive(recursive) => {
-                    if let Some(unfolded) = recursive.unfold(db, visitor).into_unfolded() {
-                        pending.push(unfolded);
-                    } else {
-                        builder.add_in_place(element);
-                    }
-                }
-                element => builder.add_in_place(element),
-            }
+        let (elements, recursively_defined) =
+            expand_union_elements(db, Type::Union(self), visitor, true, false, true);
+
+        // Keep any growing recursive references opaque when reducing the completed union.
+        let mut builder = UnionBuilder::new(db, visitor.env)
+            .unpack_aliases(false)
+            .or_recursively_defined(recursively_defined);
+        for element in elements {
+            builder.add_in_place(element);
         }
         let expanded = builder.build();
-        visitor.expanded_unions.borrow_mut().insert(self, expanded);
+        let mut expansions = visitor.expanded_unions.borrow_mut();
+        // The result is already expanded for this operation, including when changing the source
+        // of a relation revisits the same target union. Preserve its remaining recursive boundary.
+        if let Type::Union(union) = expanded {
+            expansions.insert(union, expanded);
+        }
+        expansions.insert(self, expanded);
         expanded
     }
 
@@ -423,14 +560,15 @@ impl<'db> UnionType<'db> {
         Ok(Type::Union(self))
     }
 
-    pub(crate) fn to_instance(
+    pub(super) fn to_instance(
         self,
         db: &'db dyn Db,
-        env: &ProgramEnvironment<'db>,
+        traversal: &TypeTraversal<'_, 'db, ProjectInstance>,
     ) -> Option<InstanceProjection<Type<'db>>> {
+        let env = traversal.environment();
         let mut is_exact = true;
         let instance = self.try_map(db, env, |element| {
-            let projection = element.to_instance(db, env)?;
+            let projection = traversal.visit(db, *element)?;
             is_exact &= projection.is_exact();
             Some(projection.into_inner())
         })?;
@@ -538,6 +676,15 @@ impl<'db> UnionType<'db> {
         env: &ProgramEnvironment<'db>,
         mut transform_fn: impl FnMut(&Type<'db>) -> PlaceAndQualifiers<'db>,
     ) -> PlaceAndQualifiers<'db> {
+        self.filter_map_with_boundness_and_qualifiers(db, env, |ty| Some(transform_fn(ty)))
+    }
+
+    pub(crate) fn filter_map_with_boundness_and_qualifiers(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        mut transform_fn: impl FnMut(&Type<'db>) -> Option<PlaceAndQualifiers<'db>>,
+    ) -> PlaceAndQualifiers<'db> {
         let mut builder = UnionBuilder::new(db, env);
         let mut qualifiers = TypeQualifiers::empty();
 
@@ -546,10 +693,13 @@ impl<'db> UnionType<'db> {
         let mut origin = TypeOrigin::Declared;
         let mut provenance = Provenance::Unknown;
         for ty in self.elements(db) {
-            let PlaceAndQualifiers {
+            let Some(PlaceAndQualifiers {
                 place: ty_member,
                 qualifiers: new_qualifiers,
-            } = transform_fn(ty);
+            }) = transform_fn(ty)
+            else {
+                continue;
+            };
             qualifiers |= new_qualifiers;
             match ty_member {
                 Place::Undefined => {
@@ -1128,13 +1278,17 @@ impl<'db> IntersectionType<'db> {
         tcx: TypeContext<'db>,
         visitor: &ApplyTypeMappingVisitor<'_, 'db>,
     ) -> Type<'db> {
-        if type_mapping.is_structural() {
-            let positive = self
-                .positive(db)
-                .iter()
-                .map(|positive| positive.apply_type_mapping_impl(db, type_mapping, tcx, visitor))
-                .collect::<FxOrderSet<_>>();
-            let mut negative = NegativeIntersectionElements::default();
+        let positive = self
+            .positive(db)
+            .iter()
+            .map(|positive| positive.apply_type_mapping_impl(db, type_mapping, tcx, visitor))
+            .collect::<FxOrderSet<_>>();
+        let mut negative = NegativeIntersectionElements::default();
+        // Regular promotion removes negative contributions from intersections.
+        if !matches!(
+            type_mapping,
+            TypeMapping::Promote(PromotionMode::On, PromotionKind::Regular)
+        ) {
             for element in self.negative(db) {
                 negative.insert(element.apply_type_mapping_impl(
                     db,
@@ -1143,31 +1297,20 @@ impl<'db> IntersectionType<'db> {
                     visitor,
                 ));
             }
+        }
+
+        // An unchanged substitution must not expand another layer of a recursive type.
+        // Otherwise, repeatedly resolving type-variable bindings cannot reach a fixed point.
+        if positive == *self.positive(db) && negative == *self.negative(db) {
+            return Type::Intersection(self);
+        }
+
+        if type_mapping.is_structural() {
             Type::Intersection(IntersectionType::new(db, positive, negative))
         } else {
-            let mut builder = IntersectionBuilder::new(db, visitor.env);
-            for positive in self.positive(db) {
-                builder.add_positive_in_place(positive.apply_type_mapping_impl(
-                    db,
-                    type_mapping,
-                    tcx,
-                    visitor,
-                ));
-            }
-            // Regular promotion should remove negative contributions from intersections,
-            // so we don't preserve them here when regular promotion is enabled.
-            if !matches!(
-                type_mapping,
-                TypeMapping::Promote(PromotionMode::On, PromotionKind::Regular)
-            ) {
-                for negative in self.negative(db) {
-                    builder.add_negative_in_place(negative.apply_type_mapping_impl(
-                        db,
-                        &type_mapping.flip(),
-                        tcx,
-                        visitor,
-                    ));
-                }
+            let mut builder = IntersectionBuilder::new(db, visitor.env).positive_elements(positive);
+            for element in &negative {
+                builder.add_negative_in_place(*element);
             }
             builder.build()
         }
@@ -1275,6 +1418,15 @@ impl<'db> IntersectionType<'db> {
         env: &ProgramEnvironment<'db>,
         mut transform_fn: impl FnMut(&Type<'db>) -> PlaceAndQualifiers<'db>,
     ) -> PlaceAndQualifiers<'db> {
+        self.filter_map_with_boundness_and_qualifiers(db, env, |ty| Some(transform_fn(ty)))
+    }
+
+    pub(crate) fn filter_map_with_boundness_and_qualifiers(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        mut transform_fn: impl FnMut(&Type<'db>) -> Option<PlaceAndQualifiers<'db>>,
+    ) -> PlaceAndQualifiers<'db> {
         let mut builder = IntersectionBuilder::new(db, env);
         let mut qualifiers = TypeQualifiers::empty();
 
@@ -1283,10 +1435,13 @@ impl<'db> IntersectionType<'db> {
         let mut origin = TypeOrigin::Declared;
         let mut provenance = Provenance::Unknown;
         for ty in self.positive_elements_or_object(db) {
-            let PlaceAndQualifiers {
+            let Some(PlaceAndQualifiers {
                 place: member,
                 qualifiers: new_qualifiers,
-            } = transform_fn(&ty);
+            }) = transform_fn(&ty)
+            else {
+                continue;
+            };
             qualifiers |= new_qualifiers;
             match member {
                 Place::Undefined => {}
@@ -1374,16 +1529,17 @@ impl<'db> IntersectionType<'db> {
     /// Projecting only the positive `type[Base]` is an over-approximation, since we have no
     /// representation of an exact instance type excluding subclasses, and projecting the negative
     /// `~TypeOf[Base]` to `~Base` would incorrectly exclude `Child` instances too.
-    pub(crate) fn to_instance(
+    pub(super) fn to_instance(
         self,
         db: &'db dyn Db,
-        env: &ProgramEnvironment<'db>,
+        traversal: &TypeTraversal<'_, 'db, ProjectInstance>,
     ) -> Option<InstanceProjection<Type<'db>>> {
+        let env = traversal.environment();
         let mut builder = IntersectionBuilder::new(db, env);
         let mut has_projected_positive = false;
         let mut is_exact = self.negative(db).is_empty();
         for positive in self.iter_positive(db) {
-            if let Some(projection) = positive.to_instance(db, env) {
+            if let Some(projection) = traversal.visit(db, positive) {
                 has_projected_positive = true;
                 is_exact &= projection.is_exact();
                 builder.add_positive_in_place(projection.into_inner());

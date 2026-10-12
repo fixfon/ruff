@@ -584,6 +584,27 @@ def check(node: Node[int]):
     reveal_type(node["value"])  # revealed: dict_values[Literal["value"], dict_values[Literal["value"], ...]]
 ```
 
+## Recursive TypedDict values containing class objects
+
+Both fields below contain class objects, though one field refers to the dictionary's value type:
+
+```py
+from typing import cast
+from typing_extensions import TypedDict
+from ty_extensions._internal import TypeOf
+
+class Node[T](TypedDict, closed=True):
+    leaf: type[T]
+    child: TypeOf[next(iter(cast("Node[T]", {}).values()))]
+```
+
+Reading the known field preserves its type argument:
+
+```py
+def read(node: Node[int]):
+    reveal_type(node.get("leaf"))  # revealed: type[int]
+```
+
 ## Mutually recursive TypedDict value types
 
 These declarations are accepted even though checking either field refers to the other class's
@@ -689,6 +710,108 @@ class Right[T](TypedDict, closed=True):
 
 def check(node: Left[Any]):
     iter(node.values())  # no diagnostic
+```
+
+## Materializing recursive TypedDict values
+
+Each recursive reference adds a `list` to the type argument. The resulting value can be passed to a
+generic function, but applying `Top` does not make it suitable for keyword unpacking:
+
+```py
+from typing import Any, cast
+from typing_extensions import TypedDict
+from ty_extensions import Bottom, Top, static_assert
+from ty_extensions._internal import TypeOf, is_assignable_to
+
+class Node[T](TypedDict, closed=True):
+    leaf: T
+    child: Top[TypeOf[next(iter(cast("Node[list[T]]", {}).values()))]]
+
+def consume[U](value: U): ...
+def check(node: Node[Any]):
+    value = next(iter(node.values()))
+    consume(value)  # no diagnostic
+    dict(**value)  # error: [invalid-argument-type]
+```
+
+The value may also lack the methods that `reversed` needs:
+
+```py
+def reverse_values(node: Node[Any]):
+    value = next(iter(node.values()))
+    reversed(value)  # error: [no-matching-overload]
+```
+
+The bottom materialization is assignable to the top materialization:
+
+```py
+def materialize(node: Node[Any]):
+    value = next(iter(node.values()))
+    static_assert(is_assignable_to(Bottom[TypeOf[value]], Top[TypeOf[value]]))
+```
+
+Inside the `isinstance` branch, the value is a dictionary or a list:
+
+```py
+def narrow(node: Node[Any]):
+    value = next(iter(node.values()))
+    if isinstance(value, (dict, list)):
+        number: int = value  # error: [invalid-assignment]
+```
+
+The `**rest` capture in a mapping pattern remains a dictionary:
+
+```py
+def match_mapping(node: Node[Any]):
+    value = next(iter(node.values()))
+    match value:
+        case {"child": _, **rest}:
+            rest.clear()  # no diagnostic
+            rest.append(1)  # error: [unresolved-attribute]
+```
+
+## Materializing recursive values with two type parameters
+
+Recursive references can also change the order of the type arguments. Applying `Top` still leaves
+values that cannot be unpacked as keyword arguments:
+
+```py
+from typing import Any, cast
+from typing_extensions import TypedDict
+from ty_extensions import Top
+from ty_extensions._internal import TypeOf
+
+class Node[T, U](TypedDict, closed=True):
+    leaf: T
+    child: Top[TypeOf[next(iter(cast("Node[list[U], T]", {}).values()))]]
+
+def check(node: Node[Any, int]):
+    value = next(iter(node.values()))
+    dict(**value)  # error: [invalid-argument-type]
+```
+
+## Materializing mutually recursive TypedDict values
+
+Materialization can also occur between two recursive declarations. Their values can include lists,
+so assigning a value to `int` is rejected:
+
+```py
+from typing import Any, cast
+from typing_extensions import TypedDict
+from ty_extensions import Top
+from ty_extensions._internal import TypeOf
+
+class Left[T](TypedDict, closed=True):
+    leaf: T
+    value: TypeOf[next(iter(cast("Right[list[T]]", {}).values()))]
+
+class Right[T](TypedDict, closed=True):
+    leaf: T
+    value: Top[TypeOf[next(iter(cast("Left[T]", {}).values()))]]
+
+def check(node: Left[Any]):
+    value = next(iter(node.values()))
+    number: int = value  # error: [invalid-assignment]
 ```
 
 ## Diagnostics for bad specializations

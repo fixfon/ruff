@@ -1802,6 +1802,15 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
             }
         }
 
+        // A union contains each of its elements. Check this before unfolding recursive types,
+        // which can otherwise replace the matching element with a larger specialization.
+        if let Type::Union(union) = target
+            && self.relation.can_safely_assume_reflexivity(source)
+            && union.elements(db).contains(&source)
+        {
+            return self.always();
+        }
+
         match (source, target) {
             (Type::RecursiveVar(_), _) | (_, Type::RecursiveVar(_)) => {
                 unreachable!("semantic operation on an unbound recursive variable")
@@ -1890,7 +1899,9 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
             // Annotation unions retain type aliases so recursive aliases can be represented.
             // Normalize direct alias elements together before checking the union so reductions
             // that depend on multiple elements, such as all members of an enum, are visible.
-            (_, Type::Union(union)) if union.has_aliases(db) => {
+            (_, Type::Union(union))
+                if union.needs_alias_expansion(db, self.materialization_visitor) =>
+            {
                 self.with_recursion_guard(db, source, target, || {
                     self.check_type_pair(
                         db,
@@ -2166,21 +2177,7 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
                 },
             ),
 
-            // In general, a TypeVar `T` is not redundant with a type `S` unless one of the two conditions is satisfied:
-            // 1. `T` is a bound TypeVar and `T`'s upper bound is a subtype of `S`.
-            //    TypeVars without an explicit upper bound are treated as having an implicit upper bound of `object`.
-            // 2. `T` is a constrained TypeVar and all of `T`'s constraints are subtypes of `S`.
-            //
-            // However, there is one exception to this general rule: for any given typevar `T`,
-            // `T` will always be a subtype of any union containing `T`.
-            (_, Type::Union(union))
-                if self.relation.can_safely_assume_reflexivity(source)
-                    && union.elements(db).contains(&source) =>
-            {
-                self.always()
-            }
-
-            // A similar rule applies in reverse to intersection types.
+            // An intersection is a subtype of each of its positive elements.
             (Type::Intersection(intersection), _)
                 if self.relation.can_safely_assume_reflexivity(target)
                     && intersection.positive(db).contains(&target) =>

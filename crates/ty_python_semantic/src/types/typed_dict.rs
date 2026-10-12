@@ -22,6 +22,7 @@ use super::{
     Type, TypeMapping, TypeQualifiers, TypeVarVariance, UnionBuilder, UnionType, VarianceInferable,
     VarianceTerm, definition_expression_annotation, definition_expression_type, visitor,
 };
+use super::{CycleKind, TypeOperation, TypeTraversal};
 use crate::types::TypeContext;
 use crate::types::TypeDefinition;
 use crate::types::class::FieldKind;
@@ -1948,199 +1949,232 @@ pub(crate) fn extract_unpacked_typed_dict_from_value_type<'db>(
     env: &ProgramEnvironment<'db>,
     ty: Type<'db>,
 ) -> Option<UnpackedTypedDict<'db>> {
-    match ty {
-        Type::Recursive(recursive) => {
-            let unfolded = recursive
-                .unfold(db, &ApplyTypeMappingVisitor::new(env))
-                .into_unfolded()?;
-            extract_unpacked_typed_dict_from_value_type(db, env, unfolded)
-        }
-        Type::RecursiveVar(_) => {
-            unreachable!("semantic operation on an unbound recursive variable")
-        }
-        Type::TypedDict(td) => {
-            let keys = td
-                .items(db)
-                .iter()
-                .map(|(name, field)| {
-                    (
-                        name.clone(),
-                        UnpackedTypedDictKey {
-                            value_ty: field.declared_ty,
-                            is_required: field.is_required(),
-                            definition: field.first_declaration(),
-                        },
-                    )
-                })
-                .collect();
-            Some(UnpackedTypedDict {
-                keys,
-                openness: td.openness(db),
-            })
-        }
-        Type::Intersection(intersection) => {
-            // Collect TypedDict shapes from all TypedDicts in the intersection.
-            let unpacked_elements: Vec<_> = intersection
-                .positive(db)
-                .iter()
-                .filter_map(|element| {
-                    extract_unpacked_typed_dict_from_value_type(db, env, *element)
-                })
-                .collect();
+    TypeTraversal::new(env, UnpackTypedDict)
+        .visit(db, ty)
+        .ok()
+        .flatten()
+}
 
-            if unpacked_elements.is_empty() {
-                return None;
+struct UnpackTypedDict;
+
+impl<'db> TypeOperation<'db> for UnpackTypedDict {
+    // `Ok(None)` adds no union alternatives. `Err(())` means an alternative is not known to be
+    // a TypedDict, so the whole union cannot be unpacked as a TypedDict.
+    type Output = Result<Option<UnpackedTypedDict<'db>>, ()>;
+
+    fn on_cycle(
+        &self,
+        _traversal: &TypeTraversal<'_, 'db, Self>,
+        _ty: Type<'db>,
+        kind: CycleKind,
+        _state: (),
+    ) -> Self::Output {
+        match kind {
+            // Revisiting an exact union alternative adds no new possible keys. A changing
+            // specialization can introduce other value types, so it cannot be skipped.
+            CycleKind::Exact => Ok(None),
+            CycleKind::MatchingIdentity => Err(()),
+        }
+    }
+
+    fn visit(
+        &self,
+        db: &'db dyn Db,
+        traversal: &TypeTraversal<'_, 'db, Self>,
+        ty: Type<'db>,
+        _state: (),
+    ) -> Self::Output {
+        let env = traversal.environment();
+        match ty {
+            Type::RecursiveVar(_) => {
+                unreachable!("semantic operation on an unbound recursive variable")
             }
+            Type::TypedDict(td) => {
+                let keys = td
+                    .items(db)
+                    .iter()
+                    .map(|(name, field)| {
+                        (
+                            name.clone(),
+                            UnpackedTypedDictKey {
+                                value_ty: field.declared_ty,
+                                is_required: field.is_required(),
+                                definition: field.first_declaration(),
+                            },
+                        )
+                    })
+                    .collect();
+                Ok(Some(UnpackedTypedDict {
+                    keys,
+                    openness: td.openness(db),
+                }))
+            }
+            Type::Intersection(intersection) => {
+                // Collect TypedDict shapes from all TypedDicts in the intersection.
+                let unpacked_elements: Vec<_> = intersection
+                    .positive(db)
+                    .iter()
+                    .filter_map(|element| traversal.visit(db, *element).ok().flatten())
+                    .collect();
 
-            // Union all keys from all TypedDicts, intersecting value types for shared keys.
-            let mut result: BTreeMap<Name, UnpackedTypedDictKey<'db>> = BTreeMap::new();
+                if unpacked_elements.is_empty() {
+                    return Err(());
+                }
 
-            for unpacked in &unpacked_elements {
-                for (key, unpacked_key) in &unpacked.keys {
-                    result
-                        .entry(key.clone())
-                        .and_modify(|existing| {
-                            existing.value_ty = IntersectionType::from_two_elements(
+                // Union all keys from all TypedDicts, intersecting value types for shared keys.
+                let mut result: BTreeMap<Name, UnpackedTypedDictKey<'db>> = BTreeMap::new();
+
+                for unpacked in &unpacked_elements {
+                    for (key, unpacked_key) in &unpacked.keys {
+                        result
+                            .entry(key.clone())
+                            .and_modify(|existing| {
+                                existing.value_ty = IntersectionType::from_two_elements(
+                                    db,
+                                    env,
+                                    existing.value_ty,
+                                    unpacked_key.value_ty,
+                                );
+                                existing.is_required |= unpacked_key.is_required;
+                                existing.definition = merge_unpacked_key_definitions(
+                                    existing.definition,
+                                    unpacked_key.definition,
+                                );
+                            })
+                            .or_insert(*unpacked_key);
+                    }
+                }
+
+                for (key, unpacked_key) in &mut result {
+                    for unpacked in &unpacked_elements {
+                        if unpacked.keys.contains_key(key) {
+                            continue;
+                        }
+                        if let Some(extra_items) = unpacked.openness.effective_extra_items() {
+                            unpacked_key.value_ty = IntersectionType::from_two_elements(
                                 db,
                                 env,
-                                existing.value_ty,
                                 unpacked_key.value_ty,
+                                extra_items.declared_ty,
                             );
-                            existing.is_required |= unpacked_key.is_required;
-                            existing.definition = merge_unpacked_key_definitions(
-                                existing.definition,
-                                unpacked_key.definition,
-                            );
-                        })
-                        .or_insert(*unpacked_key);
-                }
-            }
-
-            for (key, unpacked_key) in &mut result {
-                for unpacked in &unpacked_elements {
-                    if unpacked.keys.contains_key(key) {
-                        continue;
-                    }
-                    if let Some(extra_items) = unpacked.openness.effective_extra_items() {
-                        unpacked_key.value_ty = IntersectionType::from_two_elements(
-                            db,
-                            env,
-                            unpacked_key.value_ty,
-                            extra_items.declared_ty,
-                        );
-                        unpacked_key.definition = None;
+                            unpacked_key.definition = None;
+                        }
                     }
                 }
+
+                let openness = intersect_unpacked_typed_dict_openness(
+                    db,
+                    env,
+                    unpacked_elements.iter().map(|unpacked| unpacked.openness),
+                );
+
+                Ok(Some(UnpackedTypedDict {
+                    keys: result,
+                    openness,
+                }))
             }
+            Type::Union(union) => {
+                let unpacked_elements: Vec<_> = union
+                    .elements(db)
+                    .iter()
+                    .filter_map(|element| traversal.visit(db, *element).transpose())
+                    .collect::<Result<_, _>>()?;
 
-            let openness = intersect_unpacked_typed_dict_openness(
-                db,
-                env,
-                unpacked_elements.iter().map(|unpacked| unpacked.openness),
-            );
+                if unpacked_elements.is_empty() {
+                    return Ok(None);
+                }
 
-            Some(UnpackedTypedDict {
-                keys: result,
-                openness,
-            })
-        }
-        Type::Union(union) => {
-            let unpacked_elements: Vec<_> = union
-                .elements(db)
-                .iter()
-                .map(|element| extract_unpacked_typed_dict_from_value_type(db, env, *element))
-                .collect::<Option<_>>()?;
+                let all_keys: OrderSet<Name> = unpacked_elements
+                    .iter()
+                    .flat_map(|unpacked| unpacked.keys.keys().cloned())
+                    .collect();
+                let mut result = BTreeMap::new();
 
-            let all_keys: OrderSet<Name> = unpacked_elements
-                .iter()
-                .flat_map(|unpacked| unpacked.keys.keys().cloned())
-                .collect();
-            let mut result = BTreeMap::new();
+                for key in all_keys {
+                    let mut value_ty = UnionBuilder::new(db, env);
+                    let mut is_required = true;
+                    let mut definition = None;
+                    let mut saw_key = false;
 
-            for key in all_keys {
-                let mut value_ty = UnionBuilder::new(db, env);
-                let mut is_required = true;
-                let mut definition = None;
-                let mut saw_key = false;
-
-                for unpacked in &unpacked_elements {
-                    if let Some(unpacked_key) = unpacked.keys.get(key.as_str()) {
-                        saw_key = true;
-                        value_ty.add_in_place(unpacked_key.value_ty);
-                        is_required &= unpacked_key.is_required;
-                        definition = Some(if let Some(definition) = definition {
-                            merge_unpacked_key_definitions(definition, unpacked_key.definition)
+                    for unpacked in &unpacked_elements {
+                        if let Some(unpacked_key) = unpacked.keys.get(key.as_str()) {
+                            saw_key = true;
+                            value_ty.add_in_place(unpacked_key.value_ty);
+                            is_required &= unpacked_key.is_required;
+                            definition = Some(if let Some(definition) = definition {
+                                merge_unpacked_key_definitions(definition, unpacked_key.definition)
+                            } else {
+                                unpacked_key.definition
+                            });
+                        } else if let Some(extra_items) = unpacked.openness.effective_extra_items()
+                        {
+                            saw_key = true;
+                            value_ty.add_in_place(extra_items.declared_ty);
+                            is_required = false;
+                            definition = Some(None);
                         } else {
-                            unpacked_key.definition
-                        });
-                    } else if let Some(extra_items) = unpacked.openness.effective_extra_items() {
-                        saw_key = true;
-                        value_ty.add_in_place(extra_items.declared_ty);
-                        is_required = false;
-                        definition = Some(None);
-                    } else {
-                        is_required = false;
-                        definition = Some(None);
+                            is_required = false;
+                            definition = Some(None);
+                        }
+                    }
+
+                    if saw_key {
+                        result.insert(
+                            key,
+                            UnpackedTypedDictKey {
+                                value_ty: value_ty.build(),
+                                is_required,
+                                definition: definition.flatten(),
+                            },
+                        );
                     }
                 }
 
-                if saw_key {
-                    result.insert(
-                        key,
-                        UnpackedTypedDictKey {
-                            value_ty: value_ty.build(),
-                            is_required,
-                            definition: definition.flatten(),
-                        },
-                    );
-                }
+                let openness = union_unpacked_typed_dict_openness(
+                    db,
+                    env,
+                    unpacked_elements.iter().map(|unpacked| unpacked.openness),
+                );
+
+                Ok(Some(UnpackedTypedDict {
+                    keys: result,
+                    openness,
+                }))
             }
-
-            let openness = union_unpacked_typed_dict_openness(
-                db,
-                env,
-                unpacked_elements.iter().map(|unpacked| unpacked.openness),
-            );
-
-            Some(UnpackedTypedDict {
-                keys: result,
-                openness,
-            })
+            Type::Never => Ok(None),
+            // All other types cannot contain a TypedDict
+            Type::Recursive(_)
+            | Type::TypeAlias(_)
+            | Type::Dynamic(_)
+            | Type::Divergent(_)
+            | Type::EnumComplement(_)
+            | Type::FunctionLiteral(_)
+            | Type::BoundMethod(_)
+            | Type::KnownBoundMethod(_)
+            | Type::WrapperDescriptor(_)
+            | Type::DataclassDecorator(_)
+            | Type::DataclassTransformer(_)
+            | Type::Callable(_)
+            | Type::ModuleLiteral(_)
+            | Type::ClassLiteral(_)
+            | Type::GenericAlias(_)
+            | Type::SubclassOf(_)
+            | Type::NominalInstance(_)
+            | Type::ProtocolInstance(_)
+            | Type::SpecialForm(_)
+            | Type::KnownInstance(_)
+            | Type::PropertyInstance(_)
+            | Type::SlotDescriptor(_)
+            | Type::AlwaysTruthy
+            | Type::AlwaysFalsy
+            | Type::LiteralValue(_)
+            | Type::TypeVar(_)
+            | Type::BoundSuper(_)
+            | Type::TypeIs(_)
+            | Type::TypeGuard(_)
+            | Type::TypeForm(_)
+            | Type::NewTypeInstance(_) => Err(()),
         }
-        Type::TypeAlias(alias) => {
-            extract_unpacked_typed_dict_from_value_type(db, env, alias.value_type(db))
-        }
-        // All other types cannot contain a TypedDict
-        Type::Dynamic(_)
-        | Type::Divergent(_)
-        | Type::Never
-        | Type::EnumComplement(_)
-        | Type::FunctionLiteral(_)
-        | Type::BoundMethod(_)
-        | Type::KnownBoundMethod(_)
-        | Type::WrapperDescriptor(_)
-        | Type::DataclassDecorator(_)
-        | Type::DataclassTransformer(_)
-        | Type::Callable(_)
-        | Type::ModuleLiteral(_)
-        | Type::ClassLiteral(_)
-        | Type::GenericAlias(_)
-        | Type::SubclassOf(_)
-        | Type::NominalInstance(_)
-        | Type::ProtocolInstance(_)
-        | Type::SpecialForm(_)
-        | Type::KnownInstance(_)
-        | Type::PropertyInstance(_)
-        | Type::SlotDescriptor(_)
-        | Type::AlwaysTruthy
-        | Type::AlwaysFalsy
-        | Type::LiteralValue(_)
-        | Type::TypeVar(_)
-        | Type::BoundSuper(_)
-        | Type::TypeIs(_)
-        | Type::TypeGuard(_)
-        | Type::TypeForm(_)
-        | Type::NewTypeInstance(_) => None,
     }
 }
 

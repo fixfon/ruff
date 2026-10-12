@@ -36,8 +36,8 @@ use crate::types::function::FunctionLiteral;
 use crate::types::generics::{GenericContext, Specialization};
 use crate::types::visitor::{TypeCollector, TypeVisitor, walk_type_with_recursion_guard};
 use crate::types::{
-    ApplyTypeMappingVisitor, BoundTypeVarIdentity, BoundTypeVarInstance, ProtocolInstanceType,
-    RecursiveType, StaticClassLiteral, Type, TypeAliasType, TypedDictType,
+    ApplyTypeMappingVisitor, BoundTypeVarIdentity, BoundTypeVarInstance, MaterializationKind,
+    ProtocolInstanceType, RecursiveType, StaticClassLiteral, Type, TypeAliasType, TypedDictType,
 };
 use crate::{Db, ProgramEnvironment};
 
@@ -49,7 +49,11 @@ pub enum TypeIdentity<'db> {
     GrowingProtocol(Definition<'db>),
     GrowingTypeAlias(Definition<'db>),
     GrowingTypedDict(Definition<'db>),
-    GrowingRecursive(Definition<'db>),
+    GrowingRecursive {
+        definition: Definition<'db>,
+        materialization: Option<MaterializationKind>,
+        argument_materialization: Option<MaterializationKind>,
+    },
     Other(Type<'db>),
 }
 
@@ -77,7 +81,14 @@ impl<'db> Type<'db> {
             }
             (Type::TypeAlias(a), Type::TypeAlias(b)) => a.definition(db) == b.definition(db),
             (Type::TypedDict(a), Type::TypedDict(b)) => a.definition(db) == b.definition(db),
-            (Type::Recursive(a), Type::Recursive(b)) => a.definition(db) == b.definition(db),
+            (Type::Recursive(a), Type::Recursive(b)) => {
+                a.definition(db) == b.definition(db)
+                    && a.materialization_kind(db) == b.materialization_kind(db)
+                    && a.arguments(db)
+                        .and_then(|args| args.materialization_kind(db))
+                        == b.arguments(db)
+                            .and_then(|args| args.materialization_kind(db))
+            }
             _ => false,
         }
     }
@@ -85,6 +96,12 @@ impl<'db> Type<'db> {
     #[allow(clippy::inline_always)]
     #[inline(always)]
     fn recursive_identity(self, db: &'db dyn Db) -> Option<TypeIdentity<'db>> {
+        let growing_definition = || {
+            let target = RecursiveDefinition::from_type(db, self)?.target;
+            target
+                .may_have_unbounded_specialization(db)
+                .then(|| target.definition(db))
+        };
         match self {
             // We can create a self-referential function type: e.g. `def f(x: "TypeOf[f]"): reveal_type(x)`
             // To avoid the difficulty of equality checking for function types containing this, we simply use `literal` for equality checking.
@@ -100,22 +117,18 @@ impl<'db> Type<'db> {
             // that visits stop even though no exact type repeats. Recursion that revisits one
             // exact specialization (e.g. `type RecursiveT = int | tuple[RecursiveT, ...]`) needs
             // no definition-level identity: the detectors stop on the repeated type itself.
-            Type::TypeAlias(_)
-            | Type::ProtocolInstance(_)
-            | Type::TypedDict(_)
-            | Type::Recursive(_) => {
-                let target = RecursiveDefinition::from_type(db, self)?.target;
-                if !target.may_have_unbounded_specialization(db) {
-                    return None;
-                }
-                let definition = target.definition(db);
-                Some(match target {
-                    RecursiveDefinition::TypeAlias(_) => TypeIdentity::GrowingTypeAlias(definition),
-                    RecursiveDefinition::Protocol(_) => TypeIdentity::GrowingProtocol(definition),
-                    RecursiveDefinition::TypedDict(_) => TypeIdentity::GrowingTypedDict(definition),
-                    RecursiveDefinition::Structural(_) => {
-                        TypeIdentity::GrowingRecursive(definition)
-                    }
+            Type::TypeAlias(_) => growing_definition().map(TypeIdentity::GrowingTypeAlias),
+            Type::ProtocolInstance(_) => growing_definition().map(TypeIdentity::GrowingProtocol),
+            Type::TypedDict(_) => growing_definition().map(TypeIdentity::GrowingTypedDict),
+            Type::Recursive(recursive) => {
+                // Materialization can change the outer shape, such as `Any` becoming `object`.
+                // Inspect that shape before treating further argument growth as a repeated visit.
+                Some(TypeIdentity::GrowingRecursive {
+                    definition: growing_definition()?,
+                    materialization: recursive.materialization_kind(db),
+                    argument_materialization: recursive
+                        .arguments(db)
+                        .and_then(|args| args.materialization_kind(db)),
                 })
             }
             _ => None,
@@ -128,7 +141,7 @@ impl<'db> RecursiveType<'db> {
     pub(super) fn may_have_unbounded_specialization(self, db: &'db dyn Db) -> bool {
         matches!(
             Type::Recursive(self).recursive_identity(db),
-            Some(TypeIdentity::GrowingRecursive(_))
+            Some(TypeIdentity::GrowingRecursive { .. })
         )
     }
 }
@@ -1017,6 +1030,61 @@ where
     }
 }
 
+impl<'db, Tag, T, const INLINE_CAPACITY: usize> CycleDetector<'db, Tag, T, (), INLINE_CAPACITY>
+where
+    T: Hash + Eq + Clone + HasIdentity<'db>,
+{
+    /// Keep a visit active throughout `compute`, without caching its result.
+    /// `compute` receives `None` on entry and a cycle kind when revisiting an active item.
+    ///
+    /// A traversal's result can depend on which enclosing types are still active. In that case,
+    /// only the active recursion stack can be shared between visits.
+    pub(super) fn visit_active<R>(
+        &self,
+        db: &'db dyn Db,
+        item: T,
+        compute: impl FnOnce(Option<CycleKind>) -> R,
+    ) -> R {
+        match self.begin_active_visit(db, item) {
+            CycleDetectorVisit::Ready(()) => compute(Some(CycleKind::Exact)),
+            CycleDetectorVisit::Cycle(_) => compute(Some(CycleKind::MatchingIdentity)),
+            CycleDetectorVisit::Pending(item) => {
+                let _guard = ActiveTypeVisit {
+                    seen: &self.seen,
+                    item,
+                };
+                compute(None)
+            }
+        }
+    }
+}
+
+/// Whether a recursive operation revisited the same type or another specialization of it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CycleKind {
+    Exact,
+    /// The types have the same recursive identity, but their arguments can differ.
+    MatchingIdentity,
+}
+
+struct ActiveTypeVisit<'a, 'db, T: HasIdentity<'db> + PartialEq, const INLINE_CAPACITY: usize> {
+    seen: &'a RefCell<SmallVec<[ActiveCycleDetectorVisit<'db, T>; INLINE_CAPACITY]>>,
+    item: T,
+}
+
+impl<'db, T: HasIdentity<'db> + PartialEq, const INLINE_CAPACITY: usize> Drop
+    for ActiveTypeVisit<'_, 'db, T, INLINE_CAPACITY>
+{
+    fn drop(&mut self) {
+        let active = self.seen.borrow_mut().pop();
+        debug_assert!(
+            active
+                .as_ref()
+                .is_some_and(|active| active.item == self.item)
+        );
+    }
+}
+
 struct ActiveCycleDetectorVisit<'db, T: HasIdentity<'db>> {
     item: T,
     identity: OnceCell<T::Id>,
@@ -1258,7 +1326,7 @@ mod tests {
     use std::assert_matches;
 
     use super::{
-        CycleDetector, CycleDetectorVisit, Db, FlowEdge, FlowKind, HasIdentity,
+        CycleDetector, CycleDetectorVisit, CycleKind, Db, FlowEdge, FlowKind, HasIdentity,
         RecursiveDefinition, SpecializationFlowGraph, TypeIdentity,
     };
     use crate::ProgramEnvironment;
@@ -1269,6 +1337,7 @@ mod tests {
     use ruff_db::system::DbWithWritableSystem;
     use std::cell::Cell;
     use std::hash::{Hash, Hasher};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use ty_python_core::ProgramFile;
 
     struct TestVisit;
@@ -1667,6 +1736,40 @@ class RecursivePropertySetter[T](Protocol):
             detector.visit(db, 1, || detector.visit(db, 1, || 20) + 10),
             10
         );
+    }
+
+    #[test]
+    fn active_visits_distinguish_cycles_without_caching_results() {
+        let db = setup_db();
+        let detector = CycleDetector::<'_, TestVisit, ConstantIdentityItem, (), 1>::new(());
+
+        detector.visit_active(&db, ConstantIdentityItem(1), |cycle| {
+            assert_eq!(cycle, None);
+            assert_eq!(
+                detector.visit_active(&db, ConstantIdentityItem(1), |cycle| cycle),
+                Some(CycleKind::Exact),
+            );
+            assert_eq!(
+                detector.visit_active(&db, ConstantIdentityItem(2), |cycle| cycle),
+                Some(CycleKind::MatchingIdentity),
+            );
+        });
+
+        assert_eq!(
+            detector.visit_active(&db, ConstantIdentityItem(2), |cycle| cycle),
+            None,
+        );
+    }
+
+    #[test]
+    fn active_visits_are_released_when_unwinding() {
+        let db = setup_db();
+        let detector = CycleDetector::<'_, TestVisit, u8, (), 1>::new(());
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            detector.visit_active(&db, 1, |_| panic!("stop the traversal"));
+        }));
+        assert!(result.is_err());
+        assert!(detector.visit_active(&db, 1, |cycle| cycle.is_none()));
     }
 
     #[test]

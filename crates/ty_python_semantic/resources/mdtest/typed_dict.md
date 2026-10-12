@@ -9257,6 +9257,56 @@ class Node(
     value: Any
 ```
 
+### Unpacking a recursive value type
+
+A field can refer to all values of its own TypedDict. If those values include `int`, they cannot be
+unpacked as keyword arguments:
+
+```py
+from typing import cast
+from typing_extensions import TypedDict
+from ty_extensions._internal import TypeOf
+
+class Node(TypedDict, closed=True):
+    leaf: int
+    child: TypeOf[next(iter(cast("Node", {}).values()))]
+
+def check(node: Node):
+    dict(**next(iter(node.values())))  # error: [invalid-argument-type]
+```
+
+### Recursive values that are TypedDicts
+
+If every concrete value is a TypedDict, unpacking those values preserves its required keys and their
+types:
+
+```py
+from typing import cast
+from typing_extensions import TypedDict
+from ty_extensions._internal import TypeOf
+
+class Payload(TypedDict, closed=True):
+    value: int
+
+class Node(TypedDict, closed=True):
+    leaf: Payload
+    child: TypeOf[next(iter(cast("Node", {}).values()))]
+
+def unpack(node: Node):
+    value = next(iter(node.values()))
+    Payload(**value)  # no diagnostic
+    reveal_type(dict(**value))  # revealed: dict[str, int]
+```
+
+A key-membership test also preserves the declared field type:
+
+```py
+def narrow(node: Node):
+    value = next(iter(node.values()))
+    if "value" in value:
+        reveal_type(value["value"])  # revealed: int
+```
+
 [closed]: https://peps.python.org/pep-0728/#disallowing-extra-items-explicitly
 [subtyping section]: https://typing.python.org/en/latest/spec/typeddict.html#subtyping-between-typeddict-types
 [`typeddict`]: https://typing.python.org/en/latest/spec/typeddict.html

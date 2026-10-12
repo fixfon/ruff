@@ -3307,6 +3307,30 @@ class Unannotated(Inferred, Right):
 reveal_type(Unannotated.value)  # revealed: int
 ```
 
+## Attributes of recursive TypedDict values
+
+A recursive value type retains the attribute declarations of its concrete alternatives. Reads
+preserve the declared type, and writes are checked against it:
+
+```py
+from typing import cast
+from typing_extensions import TypedDict
+from ty_extensions._internal import TypeOf
+
+class Payload:
+    value: int
+
+class Node(TypedDict, closed=True):
+    leaf: Payload
+    child: TypeOf[next(iter(cast("Node", {}).values()))]
+
+def check(node: Node):
+    value = next(iter(node.values()))
+    reveal_type(value.value)  # revealed: int
+    value.value = 1  # no diagnostic
+    value.value = "wrong"  # error: [invalid-assignment]
+```
+
 ## Intersections of attributes
 
 ### Attribute only available on one element

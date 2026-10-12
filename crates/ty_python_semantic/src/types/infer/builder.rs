@@ -127,14 +127,14 @@ use crate::types::unpacker::{
 };
 use crate::types::{
     ApplyTypeMappingVisitor, BindingContext, BoundTypeVarInstance, CallDunderError,
-    CallableBinding, CallableType, ClassType, DynamicType, GeneratorTypeMode, InferenceFlags,
-    InternedConstraintSet, InternedType, IntersectionBuilder, IntersectionType,
+    CallableBinding, CallableType, ClassType, CycleKind, DynamicType, GeneratorTypeMode,
+    InferenceFlags, InternedConstraintSet, InternedType, IntersectionBuilder, IntersectionType,
     KnownBoundMethodType, KnownClass, KnownInstanceType, KnownUnion, LiteralValueType,
     LiteralValueTypeKind, MemberLookupPolicy, ParamSpecAttrKind, Parameter, Parameters,
     ProgramEnvironment, PropertyDeprecations, SentinelInstance, Signature, SpecialFormType,
-    SubclassOfType, Type, TypeAliasType, TypeAndQualifiers, TypeContext, TypeQualifiers,
-    TypeVarBoundOrConstraints, TypeVarKind, TypeVarVariance, TypingModule, UnionAccumulator,
-    UnionBuilder, UnionType, any_over_type, binding_type,
+    SubclassOfType, Type, TypeAliasType, TypeAndQualifiers, TypeContext, TypeOperation,
+    TypeQualifiers, TypeTraversal, TypeVarBoundOrConstraints, TypeVarKind, TypeVarVariance,
+    TypingModule, UnionAccumulator, UnionBuilder, UnionType, any_over_type, binding_type,
     extract_fixed_length_iterable_element_types, infer_complete_scope_types, infer_scope_types,
     is_discarded_dict_key_assignment, todo_type,
 };
@@ -481,6 +481,72 @@ fn transparent_callable_decorator_result<'db>(
         Type::FunctionLiteral(function) => Some(Type::Callable(function.into_callable_type(db))),
         Type::Callable(_) => Some(decorated_ty),
         _ => None,
+    }
+}
+
+struct AttributeDeletion<'a> {
+    target: &'a ast::ExprAttribute,
+    attribute: &'a str,
+}
+
+impl<'a, 'db, 'ast> TypeOperation<'db, (&'a mut TypeInferenceBuilder<'db, 'ast>, bool)>
+    for AttributeDeletion<'_>
+{
+    type Output = bool;
+
+    fn on_cycle(
+        &self,
+        _traversal: &TypeTraversal<'_, 'db, Self>,
+        _ty: Type<'db>,
+        _kind: CycleKind,
+        _state: (&'a mut TypeInferenceBuilder<'db, 'ast>, bool),
+    ) -> bool {
+        true
+    }
+
+    fn visit(
+        &self,
+        db: &'db dyn Db,
+        traversal: &TypeTraversal<'_, 'db, Self>,
+        ty: Type<'db>,
+        (builder, emit_diagnostics): (&'a mut TypeInferenceBuilder<'db, 'ast>, bool),
+    ) -> bool {
+        match ty {
+            Type::Recursive(_) => true,
+            Type::Union(union) => union.elements(db).iter().all(|element| {
+                traversal.visit_with(db, *element, (&mut *builder, emit_diagnostics))
+            }),
+            Type::Intersection(intersection) => {
+                let positive = intersection.positive(db);
+                let can_delete = positive
+                    .iter()
+                    .any(|element| traversal.visit_with(db, *element, (&mut *builder, false)));
+                if can_delete {
+                    !builder.validate_final_attribute_deletion(
+                        self.target,
+                        ty,
+                        self.attribute,
+                        emit_diagnostics,
+                    )
+                } else {
+                    if emit_diagnostics && let Some(element) = positive.first() {
+                        traversal.visit_with(db, *element, (builder, true));
+                    }
+                    false
+                }
+            }
+            Type::EnumComplement(complement) => traversal.visit_with(
+                db,
+                complement.remaining_literal_union(db, traversal.environment()),
+                (builder, emit_diagnostics),
+            ),
+            _ => builder.validate_attribute_deletion_leaf(
+                self.target,
+                ty,
+                self.attribute,
+                emit_diagnostics,
+            ),
+        }
     }
 }
 
@@ -3093,93 +3159,32 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         attribute: &str,
         emit_diagnostics: bool,
     ) -> bool {
+        let db = self.db();
+        let env = self.program_environment().clone();
+        TypeTraversal::new(&env, AttributeDeletion { target, attribute }).visit_with(
+            db,
+            object_ty,
+            (self, emit_diagnostics),
+        )
+    }
+
+    fn validate_attribute_deletion_leaf(
+        &mut self,
+        target: &ast::ExprAttribute,
+        object_ty: Type<'db>,
+        attribute: &str,
+        emit_diagnostics: bool,
+    ) -> bool {
         let env = self.program_environment();
         let db = self.db();
 
         match object_ty {
-            Type::Recursive(recursive) => recursive
-                .unfold(db, &ApplyTypeMappingVisitor::new(env))
-                .is_unchanged_or(|unfolded| {
-                    self.validate_attribute_deletion(target, unfolded, attribute, emit_diagnostics)
-                }),
-            Type::RecursiveVar(_) => {
-                unreachable!("semantic operation on an unbound recursive variable")
-            }
-            Type::Union(union) => {
-                for element_ty in union.elements(db) {
-                    if !self.validate_attribute_deletion(
-                        target,
-                        *element_ty,
-                        attribute,
-                        emit_diagnostics,
-                    ) {
-                        return false;
-                    }
-                }
-                true
-            }
-
-            Type::Intersection(intersection) => {
-                let positive = intersection.positive(db);
-                if positive.iter().any(|element_ty| {
-                    self.validate_attribute_deletion(target, *element_ty, attribute, false)
-                }) {
-                    !self.validate_final_attribute_deletion(
-                        target,
-                        object_ty,
-                        attribute,
-                        emit_diagnostics,
-                    )
-                } else {
-                    if emit_diagnostics && let Some(element_ty) = positive.first() {
-                        self.validate_attribute_deletion(target, *element_ty, attribute, true);
-                    }
-                    false
-                }
-            }
-
-            Type::EnumComplement(complement) => self.validate_attribute_deletion(
-                target,
-                complement.remaining_literal_union(db, env),
-                attribute,
-                emit_diagnostics,
-            ),
-
-            // Type aliases need their own arm so aliased unions and intersections reuse the
-            // specialized handling above. `NewType` instances don't: dunder lookup and attribute
-            // fallback already delegate through the concrete base type when needed.
-            Type::TypeAlias(alias) => self.validate_attribute_deletion(
-                target,
-                alias.value_type(db),
-                attribute,
-                emit_diagnostics,
-            ),
-
-            Type::NominalInstance(..)
-            | Type::ProtocolInstance(_)
-            | Type::LiteralValue(..)
-            | Type::SpecialForm(..)
-            | Type::ClassLiteral(..)
-            | Type::GenericAlias(..)
-            | Type::SubclassOf(..)
-            | Type::KnownInstance(..)
-            | Type::PropertyInstance(..)
-            | Type::SlotDescriptor(..)
-            | Type::FunctionLiteral(..)
-            | Type::Callable(..)
-            | Type::BoundMethod(_)
-            | Type::KnownBoundMethod(_)
-            | Type::WrapperDescriptor(_)
-            | Type::DataclassDecorator(_)
-            | Type::DataclassTransformer(_)
-            | Type::TypeVar(..)
-            | Type::AlwaysTruthy
-            | Type::AlwaysFalsy
-            | Type::TypeIs(_)
-            | Type::TypeGuard(_)
-            | Type::TypeForm(_)
-            | Type::TypedDict(_)
-            | Type::NewTypeInstance(_) => {
+            Type::Dynamic(_)
+            | Type::Divergent(_)
+            | Type::Never
+            | Type::ModuleLiteral(_)
+            | Type::BoundSuper(_) => true,
+            _ => {
                 let frozen_dataclass_dispatch = object_ty
                     .nominal_class(db, env)
                     .and_then(|class| class.static_class_literal(db))
@@ -3366,12 +3371,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
                 true
             }
-
-            Type::Dynamic(..)
-            | Type::Divergent(_)
-            | Type::Never
-            | Type::ModuleLiteral(..)
-            | Type::BoundSuper(..) => true,
         }
     }
 
@@ -10991,19 +10990,43 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         attribute: &ast::ExprAttribute,
         mut value_type: Type<'db>,
     ) -> Result<TypeAndQualifiers<'db>, TypeAndQualifiers<'db>> {
-        fn union_elements_missing_attribute<'db>(
-            db: &'db dyn Db,
-            env: &ProgramEnvironment<'db>,
-            ty: Type<'db>,
-            attr_name: &str,
-            missing_types: &mut FxIndexSet<Type<'db>>,
-        ) {
-            if let Some(union) = ty.as_union_like(db) {
-                for element in union.elements(db) {
-                    union_elements_missing_attribute(db, env, *element, attr_name, missing_types);
+        struct MissingAttribute<'a>(&'a str);
+
+        impl<'db> TypeOperation<'db> for MissingAttribute<'_> {
+            type Output = Vec<Type<'db>>;
+
+            fn on_cycle(
+                &self,
+                _traversal: &TypeTraversal<'_, 'db, Self>,
+                _ty: Type<'db>,
+                _kind: CycleKind,
+                _state: (),
+            ) -> Self::Output {
+                Vec::new()
+            }
+
+            fn visit(
+                &self,
+                db: &'db dyn Db,
+                traversal: &TypeTraversal<'_, 'db, Self>,
+                ty: Type<'db>,
+                _state: (),
+            ) -> Self::Output {
+                if let Some(union) = ty.as_union_like(db) {
+                    union
+                        .elements(db)
+                        .iter()
+                        .flat_map(|element| traversal.visit(db, *element))
+                        .collect()
+                } else if ty
+                    .member(db, traversal.environment(), self.0)
+                    .place
+                    .is_undefined()
+                {
+                    vec![ty]
+                } else {
+                    Vec::new()
                 }
-            } else if ty.member(db, env, attr_name).place.is_undefined() {
-                missing_types.insert(ty);
             }
         }
 
@@ -11278,14 +11301,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
                     if let Some(union) = union_like_type.as_union_like(db) {
                         let mut elements_missing_the_attribute = FxIndexSet::default();
+                        let traversal = TypeTraversal::new(env, MissingAttribute(attr_name));
                         for element in union.elements(db) {
-                            union_elements_missing_attribute(
-                                db,
-                                env,
-                                *element,
-                                attr_name,
-                                &mut elements_missing_the_attribute,
-                            );
+                            elements_missing_the_attribute.extend(traversal.visit(db, *element));
                         }
 
                         if !elements_missing_the_attribute.is_empty() {
