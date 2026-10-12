@@ -1,6 +1,5 @@
 use ruff_python_ast as ast;
 use ruff_text_size::Ranged;
-use smallvec::{SmallVec, smallvec};
 
 use super::{ArgumentsIter, MultiInferenceGuard, TypeInferenceBuilder};
 use crate::Db;
@@ -14,12 +13,14 @@ use crate::types::attribute_write::{
 };
 use crate::types::call::{Bindings, CallArguments, CallDiagnosticOverride, CallError};
 use crate::types::class::FrozenDataclassDispatch;
+use crate::types::cyclic::CycleKind;
 use crate::types::dedicated::pydantic;
 use crate::types::diagnostic::{
     DEPRECATED, INVALID_ASSIGNMENT, INVALID_ATTRIBUTE_ACCESS, MISSING_SLOT, UNRESOLVED_ATTRIBUTE,
     report_bad_dunder_set_call, report_invalid_attribute_assignment,
     report_possibly_missing_attribute,
 };
+use crate::types::recursive::{TypeOperation, TypeTraversal};
 use crate::types::{
     CallDunderError, DisplaySettings, MemberLookupPolicy, PropertyDeprecations, Type, TypeContext,
     TypeQualifiers,
@@ -413,26 +414,13 @@ impl<'db> AssignmentAttributeWriteEvaluator<'_, 'db, '_, '_> {
                     {
                         return false;
                     }
-                    self.descriptor_write_alternatives(*descriptor_ty)
-                        .all(|descriptor_ty| {
-                            match self.evaluate_descriptor_write(
-                                descriptor_ty,
-                                *receiver_ty,
-                                value_ty,
-                                emit_diagnostics,
-                            ) {
-                                Some(Definedness::AlwaysDefined) => true,
-                                Some(Definedness::PossiblyUndefined) => {
-                                    if emit_diagnostics {
-                                        self.report(
-                                            AssignmentAttributeWriteDiagnostic::CannotAssign,
-                                        );
-                                    }
-                                    false
-                                }
-                                None => false,
-                            }
-                        })
+                    self.evaluate_descriptor_alternatives(
+                        *descriptor_ty,
+                        *receiver_ty,
+                        value_ty,
+                        Definedness::AlwaysDefined,
+                        emit_diagnostics,
+                    )
                 }
                 None => {
                     self.infer_value(TypeContext::default(), emit_diagnostics);
@@ -775,16 +763,13 @@ impl<'db> AssignmentAttributeWriteEvaluator<'_, 'db, '_, '_> {
     ) -> bool {
         match requirement {
             ExplicitAttributeWriteRequirement::Descriptor { descriptor_ty, .. } => self
-                .descriptor_write_alternatives(*descriptor_ty)
-                .all(|descriptor_ty| {
-                    self.evaluate_descriptor_write(
-                        descriptor_ty,
-                        object_ty,
-                        value_ty,
-                        emit_diagnostics,
-                    )
-                    .is_some()
-                }),
+                .evaluate_descriptor_alternatives(
+                    *descriptor_ty,
+                    object_ty,
+                    value_ty,
+                    Definedness::PossiblyUndefined,
+                    emit_diagnostics,
+                ),
             ExplicitAttributeWriteRequirement::AssignableTo { ty, .. } => {
                 let value_ty = self.infer_value(TypeContext::declared(Some(*ty)), false);
                 self.check_type_pair(value_ty, *ty, emit_diagnostics)
@@ -792,28 +777,30 @@ impl<'db> AssignmentAttributeWriteEvaluator<'_, 'db, '_, '_> {
         }
     }
 
-    /// Yield each possible descriptor type so writes can be checked one alternative at a time.
+    /// Check the write against each possible descriptor type.
     ///
     /// For example, if an attribute has type `IntDescriptor | StrDescriptor`, an assignment must
     /// satisfy both setters: either descriptor could be present at runtime. Checking them
     /// separately lets the caller stop and report the first alternative that rejects the write.
-    fn descriptor_write_alternatives(
-        &self,
+    fn evaluate_descriptor_alternatives(
+        &mut self,
         descriptor_ty: Type<'db>,
-    ) -> impl Iterator<Item = Type<'db>> + use<'db> {
+        receiver_ty: Type<'db>,
+        value_ty: Type<'db>,
+        required_definedness: Definedness,
+        emit_diagnostics: bool,
+    ) -> bool {
         let db = self.builder.db();
-        let mut pending: SmallVec<[_; 1]> = smallvec![descriptor_ty];
-        std::iter::from_fn(move || {
-            while let Some(descriptor_ty) = pending.pop() {
-                let descriptor_ty = descriptor_ty.resolve_type_alias(db);
-                if let Type::Union(union) = descriptor_ty {
-                    pending.extend(union.elements(db).iter().rev().copied());
-                } else {
-                    return Some(descriptor_ty);
-                }
-            }
-            None
-        })
+        TypeTraversal::new(
+            self.builder.program_environment(),
+            DescriptorWrite {
+                receiver_ty,
+                value_ty,
+                required_definedness,
+                emit_diagnostics,
+            },
+        )
+        .visit_with(db, descriptor_ty, self)
     }
 
     /// Check the setter call and return whether the setter is always or only possibly present.
@@ -824,7 +811,7 @@ impl<'db> AssignmentAttributeWriteEvaluator<'_, 'db, '_, '_> {
     /// when the setter exists, but the setter might be absent. An unconditional setter accepting
     /// the same value returns `Some(AlwaysDefined)`. Passing a string to either setter returns
     /// `None`, since the call is invalid when the setter exists.
-    fn evaluate_descriptor_write(
+    fn evaluate_descriptor_write_leaf(
         &mut self,
         descriptor_ty: Type<'db>,
         receiver_ty: Type<'db>,
@@ -1140,6 +1127,70 @@ impl<'db> AssignmentAttributeWriteEvaluator<'_, 'db, '_, '_> {
                     ));
                 }
             }
+        }
+    }
+}
+
+struct DescriptorWrite<'db> {
+    receiver_ty: Type<'db>,
+    value_ty: Type<'db>,
+    required_definedness: Definedness,
+    emit_diagnostics: bool,
+}
+
+impl<'db> TypeOperation<'db, &mut AssignmentAttributeWriteEvaluator<'_, 'db, '_, '_>>
+    for DescriptorWrite<'db>
+{
+    type Output = bool;
+
+    fn on_cycle(
+        &self,
+        _traversal: &TypeTraversal<'_, 'db, Self>,
+        _ty: Type<'db>,
+        kind: CycleKind,
+        evaluator: &mut AssignmentAttributeWriteEvaluator<'_, 'db, '_, '_>,
+    ) -> bool {
+        // Repeating the same descriptor adds no setter requirements. A growing specialization
+        // can change those requirements, so it cannot establish that the write is valid.
+        if kind == CycleKind::Exact {
+            return true;
+        }
+        if self.emit_diagnostics {
+            evaluator.report(AssignmentAttributeWriteDiagnostic::CannotAssign);
+        }
+        false
+    }
+
+    fn visit(
+        &self,
+        db: &'db dyn Db,
+        traversal: &TypeTraversal<'_, 'db, Self>,
+        descriptor_ty: Type<'db>,
+        evaluator: &mut AssignmentAttributeWriteEvaluator<'_, 'db, '_, '_>,
+    ) -> bool {
+        if let Type::Union(union) = descriptor_ty {
+            return union
+                .elements(db)
+                .iter()
+                .all(|element| traversal.visit_with(db, *element, &mut *evaluator));
+        }
+
+        match evaluator.evaluate_descriptor_write_leaf(
+            descriptor_ty,
+            self.receiver_ty,
+            self.value_ty,
+            self.emit_diagnostics,
+        ) {
+            Some(Definedness::PossiblyUndefined)
+                if self.required_definedness == Definedness::AlwaysDefined =>
+            {
+                if self.emit_diagnostics {
+                    evaluator.report(AssignmentAttributeWriteDiagnostic::CannotAssign);
+                }
+                false
+            }
+            Some(_) => true,
+            None => false,
         }
     }
 }

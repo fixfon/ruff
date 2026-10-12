@@ -1479,7 +1479,14 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                 {
                     return self.check_type_pair(db, value_ty, set_type);
                 }
-                self.check_descriptor_attribute_write(db, *descriptor_ty, object_ty, value_ty)
+                TypeTraversal::from_mapping_visitor(
+                    self.materialization_visitor,
+                    CheckDescriptorWrite {
+                        receiver_ty: object_ty,
+                        value_ty,
+                    },
+                )
+                .visit_with(db, *descriptor_ty, self)
             }
             ExplicitAttributeWriteRequirement::AssignableTo { ty, .. } => {
                 self.check_type_pair(db, value_ty, *ty)
@@ -1487,7 +1494,7 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
         }
     }
 
-    fn check_descriptor_attribute_write(
+    fn check_descriptor_attribute_write_leaf(
         &self,
         db: &'db dyn Db,
         descriptor_ty: Type<'db>,
@@ -1495,15 +1502,6 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
         value_ty: Type<'db>,
     ) -> ConstraintSet<'db, 'c> {
         let env = self.env;
-        let descriptor_ty = descriptor_ty.resolve_type_alias(db);
-        if let Type::Union(union) = descriptor_ty {
-            return union
-                .elements(db)
-                .iter()
-                .when_all(db, self.constraints, |descriptor_ty| {
-                    self.check_descriptor_attribute_write(db, *descriptor_ty, object_ty, value_ty)
-                });
-        }
         if matches!(
             descriptor_ty.try_call_dunder_with_policy(
                 db,
@@ -1619,5 +1617,50 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
             }
             FallbackAttributeWriteRequirement::PossiblyMissing => self.always(),
         }
+    }
+}
+
+struct CheckDescriptorWrite<'db> {
+    receiver_ty: Type<'db>,
+    value_ty: Type<'db>,
+}
+
+impl<'c, 'db> TypeOperation<'db, &TypeRelationChecker<'_, 'c, 'db>> for CheckDescriptorWrite<'db> {
+    type Output = ConstraintSet<'db, 'c>;
+
+    fn on_cycle(
+        &self,
+        _traversal: &TypeTraversal<'_, 'db, Self>,
+        _ty: Type<'db>,
+        kind: CycleKind,
+        checker: &TypeRelationChecker<'_, 'c, 'db>,
+    ) -> Self::Output {
+        match kind {
+            CycleKind::Exact => checker.always(),
+            CycleKind::MatchingIdentity => checker.never(),
+        }
+    }
+
+    fn visit(
+        &self,
+        db: &'db dyn Db,
+        traversal: &TypeTraversal<'_, 'db, Self>,
+        descriptor_ty: Type<'db>,
+        checker: &TypeRelationChecker<'_, 'c, 'db>,
+    ) -> Self::Output {
+        if let Type::Union(union) = descriptor_ty {
+            return union
+                .elements(db)
+                .iter()
+                .when_all(db, checker.constraints, |element| {
+                    traversal.visit_with(db, *element, checker)
+                });
+        }
+        checker.check_descriptor_attribute_write_leaf(
+            db,
+            descriptor_ty,
+            self.receiver_ty,
+            self.value_ty,
+        )
     }
 }

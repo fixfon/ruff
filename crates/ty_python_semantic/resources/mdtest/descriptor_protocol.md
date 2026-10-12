@@ -1227,6 +1227,78 @@ class C:
 C().value
 ```
 
+### Assigning through a recursive union of descriptors
+
+The `child` field has the union of all `Node` value types, including itself. Checking an assignment
+through that union terminates.
+
+```py
+from typing import cast
+from typing_extensions import TypedDict
+from ty_extensions._internal import TypeOf
+
+class Descriptor:
+    def __set__(self, instance: object, value: int) -> None: ...
+
+class Node(TypedDict, closed=True):
+    leaf: Descriptor
+    child: TypeOf[next(iter(cast("Node", {}).values()))]
+
+class Holder:
+    attr = cast(Node, {})["child"]
+
+def accepts_integer(holder: Holder):
+    holder.attr = 1  # no diagnostic
+```
+
+The recursive reference does not hide an incompatible setter argument.
+
+```py
+def rejects_string(holder: Holder):
+    holder.attr = "invalid"  # error: [invalid-assignment] "Expected `int`"
+```
+
+### Recursive descriptor unions satisfy writable protocols
+
+Checking whether a class implements a writable protocol also visits every possible setter. A
+recursive reference contributes no additional setter requirements.
+
+```py
+from typing import Protocol, cast
+from typing_extensions import TypedDict
+from ty_extensions._internal import TypeOf
+
+class Descriptor:
+    def __set__(self, instance: object, value: int) -> None: ...
+
+class Node(TypedDict, closed=True):
+    leaf: Descriptor
+    child: TypeOf[next(iter(cast("Node", {}).values()))]
+
+class Holder:
+    attr = cast(Node, {})["child"]
+
+class AcceptsInteger(Protocol):
+    @property
+    def attr(self) -> object: ...
+    @attr.setter
+    def attr(self, value: int) -> None: ...
+
+accepts_integer: AcceptsInteger = Holder()  # no diagnostic
+```
+
+The same descriptor cannot implement a setter that accepts strings.
+
+```py
+class AcceptsString(Protocol):
+    @property
+    def attr(self) -> object: ...
+    @attr.setter
+    def attr(self, value: str) -> None: ...
+
+accepts_string: AcceptsString = Holder()  # error: [invalid-assignment]
+```
+
 ### Recursive metaclass declarations containing dynamic types
 
 A recursive declaration containing `Any` can describe a data descriptor. Assignments to a class
