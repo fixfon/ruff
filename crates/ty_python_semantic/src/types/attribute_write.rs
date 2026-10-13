@@ -39,12 +39,12 @@ pub(super) enum AttributeWriteRequirement<'db> {
     /// A write to a union must be valid for every union element.
     All {
         object_ty: Type<'db>,
-        requirements: Box<[AttributeWriteRequirement<'db>]>,
+        element_tys: &'db [Type<'db>],
     },
     /// A write to an intersection may target any positive intersection element.
     Any {
         object_ty: Type<'db>,
-        requirements: Box<[AttributeWriteRequirement<'db>]>,
+        intersection: IntersectionType<'db>,
     },
     /// A value may be assigned without an attribute-specific constraint.
     Unconstrained,
@@ -282,39 +282,53 @@ impl<'db> AssignmentAttributeMembers<'db> {
     }
 }
 
-/// Resolve the receiver-level requirements for writing `object_ty.attribute`.
+pub(super) struct ResolveAttributeWrite<'a>(&'a str);
+
+/// Resolve and consume write requirements under the same recursion guard.
 ///
-/// This expands aliases, preserves the all-arms rule for unions and the any-positive-arm rule for
-/// intersections, and dispatches instance and class-object writes to their respective lookup
-/// paths. It does not compare the assigned value with the resulting types.
-pub(super) fn attribute_write_requirement<'db>(
-    db: &'db dyn Db,
-    env: &ProgramEnvironment<'db>,
-    object_ty: Type<'db>,
-    attribute: &str,
-) -> AttributeWriteRequirement<'db> {
-    TypeTraversal::with_root(env, ResolveAttributeWrite(attribute), |root| {
-        root.visit(db, object_ty)
-    })
-    .unwrap_or(AttributeWriteRequirement::Unconstrained)
+/// Composite requirements retain their child types. Resolving all children eagerly would copy
+/// shared recursive types into a tree whose size can grow exponentially.
+pub(super) type AttributeWriteResolver<'env, 'db> =
+    TypeTraversal<'env, 'db, ResolveAttributeWrite<'env>>;
+
+impl<'env, 'db> AttributeWriteResolver<'env, 'db> {
+    pub(super) fn scope<R>(
+        env: &'env ProgramEnvironment<'db>,
+        attribute: &'env str,
+        evaluate: impl FnOnce(&Self) -> R,
+    ) -> R {
+        Self::with_root(env, ResolveAttributeWrite(attribute), evaluate)
+    }
+
+    /// Keep the receiver active until its requirement and any selected children are consumed.
+    /// `None` identifies an exact recursive reference, which contributes no additional requirement.
+    pub(super) fn resolve<R>(
+        &self,
+        db: &'db dyn Db,
+        object_ty: Type<'db>,
+        evaluate: impl FnOnce(Option<AttributeWriteRequirement<'db>>) -> R,
+    ) -> R {
+        self.visit_with(db, object_ty, evaluate)
+    }
 }
 
-struct ResolveAttributeWrite<'a>(&'a str);
-
-impl<'db> TypeOperation<'db> for ResolveAttributeWrite<'_> {
-    type Output = Option<AttributeWriteRequirement<'db>>;
+impl<'db, R, F> TypeOperation<'db, F> for ResolveAttributeWrite<'_>
+where
+    F: FnOnce(Option<AttributeWriteRequirement<'db>>) -> R,
+{
+    type Output = R;
 
     fn on_cycle(
         &self,
         _traversal: &TypeTraversal<'_, 'db, Self>,
         _ty: Type<'db>,
         kind: CycleKind,
-        _state: (),
+        evaluate: F,
     ) -> Self::Output {
-        match kind {
+        evaluate(match kind {
             CycleKind::Exact => None,
             CycleKind::MatchingIdentity => Some(AttributeWriteRequirement::CannotAssign),
-        }
+        })
     }
 
     fn visit(
@@ -322,46 +336,41 @@ impl<'db> TypeOperation<'db> for ResolveAttributeWrite<'_> {
         db: &'db dyn Db,
         traversal: &TypeTraversal<'_, 'db, Self>,
         object_ty: Type<'db>,
-        _state: (),
+        evaluate: F,
     ) -> Self::Output {
         let env = traversal.environment();
         let attribute = self.0;
-        Some(match object_ty {
+        let requirement = match object_ty {
             Type::RecursiveVar(_) => {
                 unreachable!("semantic operation on an unbound recursive variable")
             }
             Type::Union(union) => {
-                let mut requirements: Vec<_> = union
-                    .elements(db)
-                    .iter()
-                    .filter_map(|element| traversal.visit(db, *element))
-                    .collect();
-                return match requirements.len() {
-                    0 => None,
-                    1 => requirements.pop(),
-                    _ => Some(AttributeWriteRequirement::All {
-                        object_ty,
-                        requirements: requirements.into_boxed_slice(),
-                    }),
-                };
+                // Expansion deduplicates shared definitions before their write requirements are
+                // evaluated. Keep the mapping visitor, including any active materialization.
+                if union.has_aliases(db) {
+                    let expanded = union.expand_aliases(db, traversal.mapping_visitor());
+                    if expanded != object_ty {
+                        return traversal.visit_with(db, expanded, evaluate);
+                    }
+                }
+                AttributeWriteRequirement::All {
+                    object_ty,
+                    element_tys: union.elements(db),
+                }
             }
             Type::Intersection(intersection) => {
                 // TODO: Handle negative intersection elements.
-                let requirements: Vec<_> = intersection
-                    .positive(db)
-                    .iter()
-                    .filter_map(|element| traversal.visit(db, *element))
-                    .collect();
-                return match requirements.len() {
-                    0 if !intersection.positive(db).is_empty() => None,
-                    _ => Some(AttributeWriteRequirement::Any {
-                        object_ty,
-                        requirements: requirements.into_boxed_slice(),
-                    }),
-                };
+                AttributeWriteRequirement::Any {
+                    object_ty,
+                    intersection,
+                }
             }
             Type::EnumComplement(complement) => {
-                return traversal.visit(db, complement.remaining_literal_union(db, env));
+                return traversal.visit_with(
+                    db,
+                    complement.remaining_literal_union(db, env),
+                    evaluate,
+                );
             }
             Type::Recursive(_) | Type::TypeAlias(_) => AttributeWriteRequirement::Unconstrained,
 
@@ -442,7 +451,8 @@ impl<'db> TypeOperation<'db> for ResolveAttributeWrite<'_> {
                     Place::Undefined => None,
                 })
             }
-        })
+        };
+        evaluate(Some(requirement))
     }
 }
 
@@ -1305,47 +1315,79 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
         value_ty: Type<'db>,
     ) -> ConstraintSet<'db, 'c> {
         let env = self.env;
-        let requirement = attribute_write_requirement(db, env, ty, member_name);
-        self.check_attribute_write_requirement(db, &requirement, member_name, value_ty)
+        AttributeWriteResolver::scope(env, member_name, |resolver| {
+            self.check_attribute_write_in(db, resolver, ty, member_name, value_ty)
+                .unwrap_or_else(|| self.always())
+        })
+    }
+
+    fn check_attribute_write_in(
+        &self,
+        db: &'db dyn Db,
+        resolver: &AttributeWriteResolver<'_, 'db>,
+        object_ty: Type<'db>,
+        member_name: &str,
+        value_ty: Type<'db>,
+    ) -> Option<ConstraintSet<'db, 'c>> {
+        resolver.resolve(db, object_ty, |requirement| {
+            requirement.and_then(|requirement| {
+                self.check_attribute_write_requirement(
+                    db,
+                    resolver,
+                    &requirement,
+                    member_name,
+                    value_ty,
+                )
+            })
+        })
     }
 
     fn check_attribute_write_requirement(
         &self,
         db: &'db dyn Db,
+        resolver: &AttributeWriteResolver<'_, 'db>,
         requirement: &AttributeWriteRequirement<'db>,
         member_name: &str,
         value_ty: Type<'db>,
-    ) -> ConstraintSet<'db, 'c> {
-        match requirement {
-            AttributeWriteRequirement::All { requirements, .. } => {
+    ) -> Option<ConstraintSet<'db, 'c>> {
+        Some(match requirement {
+            AttributeWriteRequirement::All { element_tys, .. } => {
                 let mut result = self.always();
-                for requirement in requirements {
-                    let element_result = self.check_attribute_write_requirement(
-                        db,
-                        requirement,
-                        member_name,
-                        value_ty,
-                    );
+                let mut resolved = false;
+                for ty in *element_tys {
+                    let Some(element_result) =
+                        self.check_attribute_write_in(db, resolver, *ty, member_name, value_ty)
+                    else {
+                        continue;
+                    };
+                    resolved = true;
                     result = result.and(db, self.constraints, || element_result);
                     if result.is_trivially_never_satisfied() {
                         break;
                     }
                 }
+                if !resolved {
+                    return None;
+                }
                 result
             }
-            AttributeWriteRequirement::Any { requirements, .. } => {
+            AttributeWriteRequirement::Any { intersection, .. } => {
                 let mut result = self.never();
-                for requirement in requirements {
-                    let element_result = self.check_attribute_write_requirement(
-                        db,
-                        requirement,
-                        member_name,
-                        value_ty,
-                    );
+                let mut resolved = false;
+                for ty in intersection.positive(db) {
+                    let Some(element_result) =
+                        self.check_attribute_write_in(db, resolver, *ty, member_name, value_ty)
+                    else {
+                        continue;
+                    };
+                    resolved = true;
                     result = result.or(db, self.constraints, || element_result);
                     if result.is_trivially_always_satisfied() {
                         break;
                     }
+                }
+                if !resolved && !intersection.positive(db).is_empty() {
+                    return None;
                 }
                 result
             }
@@ -1370,7 +1412,7 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
             AttributeWriteRequirement::Class { object_ty, member } => {
                 self.check_class_attribute_write(db, *object_ty, member, value_ty)
             }
-        }
+        })
     }
 
     fn check_instance_attribute_write(

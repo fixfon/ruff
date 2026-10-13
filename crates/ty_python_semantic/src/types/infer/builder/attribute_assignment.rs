@@ -5,11 +5,10 @@ use super::{ArgumentsIter, MultiInferenceGuard, TypeInferenceBuilder};
 use crate::Db;
 use crate::place::{DefinedPlace, Definedness, Place, PlaceAndQualifiers};
 use crate::types::attribute_write::{
-    AttributeWriteRequirement, ClassAttributeWriteMember, DescriptorSetterDomain,
-    ExplicitAttributeWriteRequirement, FallbackAttributeWriteRequirement,
-    InstanceAttributeWriteMember, ProtocolMemberWriteRequirement, attribute_write_requirement,
-    descriptor_setter_domain, instance_attribute_write_is_blocked, instance_setattr_dispatch,
-    property_setter_returns_never,
+    AttributeWriteRequirement, AttributeWriteResolver, ClassAttributeWriteMember,
+    DescriptorSetterDomain, ExplicitAttributeWriteRequirement, FallbackAttributeWriteRequirement,
+    InstanceAttributeWriteMember, ProtocolMemberWriteRequirement, descriptor_setter_domain,
+    instance_attribute_write_is_blocked, instance_setattr_dispatch, property_setter_returns_never,
 };
 use crate::types::call::{Bindings, CallArguments, CallDiagnosticOverride, CallError};
 use crate::types::class::FrozenDataclassDispatch;
@@ -41,9 +40,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         infer_value_ty: &mut dyn FnMut(&mut Self, TypeContext<'db>) -> Type<'db>,
         emit_diagnostics: bool,
     ) -> bool {
-        let db = self.db();
-        let requirement =
-            attribute_write_requirement(db, self.program_environment(), object_ty, attribute);
+        let env = self.program_environment();
         let mut deprecation = (emit_diagnostics && self.context.is_lint_enabled(&DEPRECATED))
             .then_some(AttributeDeprecation::Missing);
         let mut evaluator = AssignmentAttributeWriteEvaluator {
@@ -54,7 +51,14 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             attribute,
             infer_value_ty: MultiInferenceGuard::new(infer_value_ty),
         };
-        let valid = evaluator.evaluate(&requirement, emit_diagnostics, deprecation.as_mut());
+        let valid = AttributeWriteResolver::scope(env, attribute, |resolver| {
+            evaluator
+                .evaluate(resolver, object_ty, emit_diagnostics, deprecation.as_mut())
+                .unwrap_or_else(|| {
+                    evaluator.infer_value(TypeContext::default(), emit_diagnostics);
+                    true
+                })
+        });
         if let Some(AttributeDeprecation::Deprecated(properties)) = deprecation {
             self.check_deprecated_property(target, properties, ast::ExprContext::Store);
         }
@@ -107,22 +111,34 @@ enum AttributeDeprecation<'db> {
 }
 
 impl<'db> AttributeDeprecation<'db> {
-    /// Inspect a resolved requirement without inferring or validating the assigned value.
-    /// Composite requirements already contain their resolved children.
-    fn from_requirement(db: &'db dyn Db, requirement: &AttributeWriteRequirement<'db>) -> Self {
+    fn for_type(
+        db: &'db dyn Db,
+        resolver: &AttributeWriteResolver<'_, 'db>,
+        object_ty: Type<'db>,
+    ) -> Self {
+        resolver.resolve(db, object_ty, |requirement| {
+            requirement.as_ref().map_or(Self::Missing, |requirement| {
+                Self::from_requirement(db, resolver, requirement)
+            })
+        })
+    }
+
+    /// Inspect a write requirement without inferring or validating the assigned value.
+    fn from_requirement(
+        db: &'db dyn Db,
+        resolver: &AttributeWriteResolver<'_, 'db>,
+        requirement: &AttributeWriteRequirement<'db>,
+    ) -> Self {
         match requirement {
-            AttributeWriteRequirement::All { requirements, .. } => {
-                requirements
-                    .iter()
-                    .fold(Self::Missing, |deprecation, requirement| {
-                        deprecation.union(db, Self::from_requirement(db, requirement))
-                    })
+            AttributeWriteRequirement::All { element_tys, .. } => {
+                element_tys.iter().fold(Self::Missing, |deprecation, ty| {
+                    deprecation.union(db, Self::for_type(db, resolver, *ty))
+                })
             }
-            AttributeWriteRequirement::Any { requirements, .. } => {
+            AttributeWriteRequirement::Any { intersection, .. } => {
                 let mut deprecation = Self::Missing;
-                for requirement in requirements {
-                    deprecation =
-                        deprecation.intersection(db, Self::from_requirement(db, requirement));
+                for ty in intersection.positive(db) {
+                    deprecation = deprecation.intersection(db, Self::for_type(db, resolver, *ty));
                     if matches!(deprecation, Self::NotDeprecated) {
                         break;
                     }
@@ -271,43 +287,63 @@ impl<'db> AssignmentAttributeWriteEvaluator<'_, 'db, '_, '_> {
     /// When provided, `deprecation` receives the result even if validation fails.
     fn evaluate(
         &mut self,
+        resolver: &AttributeWriteResolver<'_, 'db>,
+        object_ty: Type<'db>,
+        emit_diagnostics: bool,
+        deprecation: Option<&mut AttributeDeprecation<'db>>,
+    ) -> Option<bool> {
+        resolver.resolve(self.builder.db(), object_ty, |requirement| {
+            requirement.and_then(|requirement| {
+                self.evaluate_requirement(resolver, &requirement, emit_diagnostics, deprecation)
+            })
+        })
+    }
+
+    fn evaluate_requirement(
+        &mut self,
+        resolver: &AttributeWriteResolver<'_, 'db>,
         requirement: &AttributeWriteRequirement<'db>,
         emit_diagnostics: bool,
         mut deprecation: Option<&mut AttributeDeprecation<'db>>,
-    ) -> bool {
+    ) -> Option<bool> {
         let db = self.builder.db();
         if let Some(deprecation) = deprecation.as_deref_mut() {
             *deprecation = match requirement {
                 AttributeWriteRequirement::All { .. } | AttributeWriteRequirement::Any { .. } => {
                     AttributeDeprecation::Missing
                 }
-                _ => AttributeDeprecation::from_requirement(db, requirement),
+                _ => AttributeDeprecation::from_requirement(db, resolver, requirement),
             };
         }
 
-        match requirement {
+        Some(match requirement {
             AttributeWriteRequirement::All {
                 object_ty,
-                requirements,
+                element_tys,
             } => {
                 let value_ty = self.infer_value(TypeContext::default(), emit_diagnostics);
-                let mut requirements = requirements.iter();
-                let valid = requirements.by_ref().all(|requirement| {
+                let mut elements = element_tys.iter();
+                let mut resolved = false;
+                let valid = elements.by_ref().all(|ty| {
                     let mut current = AttributeDeprecation::Missing;
                     let valid = self.evaluate(
-                        requirement,
+                        resolver,
+                        *ty,
                         false,
                         deprecation.as_ref().map(|_| &mut current),
                     );
+                    resolved |= valid.is_some();
                     if let Some(deprecation) = deprecation.as_deref_mut() {
                         *deprecation = deprecation.union(db, current);
                     }
-                    valid
+                    valid.unwrap_or(true)
                 });
+                if !resolved {
+                    return None;
+                }
                 if let Some(deprecation) = deprecation {
-                    *deprecation = requirements.fold(*deprecation, |deprecation, requirement| {
-                        deprecation
-                            .union(db, AttributeDeprecation::from_requirement(db, requirement))
+                    *deprecation = elements.fold(*deprecation, |deprecation, ty| {
+                        deprecation.union(db, AttributeDeprecation::for_type(db, resolver, *ty))
                     });
                 }
                 if valid {
@@ -324,29 +360,33 @@ impl<'db> AssignmentAttributeWriteEvaluator<'_, 'db, '_, '_> {
             }
             AttributeWriteRequirement::Any {
                 object_ty,
-                requirements,
+                intersection,
             } => {
-                let mut requirements = requirements.iter();
-                let valid = requirements.by_ref().any(|requirement| {
+                let mut elements = intersection.positive(db).iter();
+                let mut resolved = false;
+                let valid = elements.by_ref().any(|ty| {
                     let mut current = AttributeDeprecation::Missing;
                     let valid = self.evaluate(
-                        requirement,
+                        resolver,
+                        *ty,
                         false,
                         deprecation.as_ref().map(|_| &mut current),
                     );
+                    resolved |= valid.is_some();
                     if let Some(deprecation) = deprecation.as_deref_mut() {
                         *deprecation = deprecation.intersection(db, current);
                     }
-                    valid
+                    valid.unwrap_or(false)
                 });
+                if !resolved && !intersection.positive(db).is_empty() {
+                    return None;
+                }
                 if let Some(deprecation) = deprecation {
                     while !matches!(deprecation, AttributeDeprecation::NotDeprecated)
-                        && let Some(requirement) = requirements.next()
+                        && let Some(ty) = elements.next()
                     {
-                        *deprecation = deprecation.intersection(
-                            db,
-                            AttributeDeprecation::from_requirement(db, requirement),
-                        );
+                        *deprecation = deprecation
+                            .intersection(db, AttributeDeprecation::for_type(db, resolver, *ty));
                     }
                 }
                 if valid {
@@ -412,7 +452,7 @@ impl<'db> AssignmentAttributeWriteEvaluator<'_, 'db, '_, '_> {
                     if let Some(domain) = domain
                         && !self.check_type_pair(value_ty, *domain, emit_diagnostics)
                     {
-                        return false;
+                        return Some(false);
                     }
                     self.evaluate_descriptor_alternatives(
                         *descriptor_ty,
@@ -447,7 +487,7 @@ impl<'db> AssignmentAttributeWriteEvaluator<'_, 'db, '_, '_> {
             AttributeWriteRequirement::Class { object_ty, member } => {
                 self.evaluate_class(*object_ty, member, emit_diagnostics)
             }
-        }
+        })
     }
 
     fn check_type_pair(

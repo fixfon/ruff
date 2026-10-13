@@ -9307,6 +9307,56 @@ def narrow(node: Node):
         reveal_type(value["value"])  # revealed: int
 ```
 
+### Attribute writes through shared recursive values
+
+These fields refer to the values of every `Node` subclass. The subclasses inherit the same fields,
+so many references lead to the same `Payload` type.
+
+```py
+from typing import cast
+from typing_extensions import TypedDict
+from ty_extensions._internal import TypeOf
+
+class Payload:
+    value: int
+
+class Edges(TypedDict, closed=True):
+    leaf: Payload
+    edge0: TypeOf[next(iter(cast("Node0", {}).values()))]
+    edge1: TypeOf[next(iter(cast("Node1", {}).values()))]
+    edge2: TypeOf[next(iter(cast("Node2", {}).values()))]
+    edge3: TypeOf[next(iter(cast("Node3", {}).values()))]
+    edge4: TypeOf[next(iter(cast("Node4", {}).values()))]
+    edge5: TypeOf[next(iter(cast("Node5", {}).values()))]
+    edge6: TypeOf[next(iter(cast("Node6", {}).values()))]
+    edge7: TypeOf[next(iter(cast("Node7", {}).values()))]
+    edge8: TypeOf[next(iter(cast("Node8", {}).values()))]
+    edge9: TypeOf[next(iter(cast("Node9", {}).values()))]
+    edge10: TypeOf[next(iter(cast("Node10", {}).values()))]
+
+class Node0(Edges): ...
+class Node1(Edges): ...
+class Node2(Edges): ...
+class Node3(Edges): ...
+class Node4(Edges): ...
+class Node5(Edges): ...
+class Node6(Edges): ...
+class Node7(Edges): ...
+class Node8(Edges): ...
+class Node9(Edges): ...
+class Node10(Edges): ...
+```
+
+Checking a write to these values does not duplicate the shared types. The attribute still requires
+an `int`:
+
+```py
+def check(node: Node0):
+    value = next(iter(node.values()))
+    value.value = 1  # no diagnostic
+    value.value = "invalid"  # error: [invalid-assignment]
+```
+
 [closed]: https://peps.python.org/pep-0728/#disallowing-extra-items-explicitly
 [subtyping section]: https://typing.python.org/en/latest/spec/typeddict.html#subtyping-between-typeddict-types
 [`typeddict`]: https://typing.python.org/en/latest/spec/typeddict.html
