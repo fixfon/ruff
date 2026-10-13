@@ -113,7 +113,7 @@ mod stable {
         structural_negation_subtyping_matches_materialized_negation, db, env,
         forall types s, t. {
             let mut cache = None;
-            s.negation_is_subtype_of_cached(db, env, t, &mut cache) == s.negate(db, env).is_subtype_of(db, env, t)
+            s.negation_is_subtype_of_cached(db, env, t, &mut cache, None) == s.negate(db, env).is_subtype_of(db, env, t)
         }
     );
 

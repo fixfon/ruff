@@ -188,7 +188,7 @@ impl<'env, 'db, O> TypeTraversal<'env, 'db, O> {
         Self {
             operation,
             env: visitor.env,
-            recursion_context: visitor.recursion_context,
+            recursion_context: Some(visitor.recursion_context()),
             mapping: TraversalMapping::Borrowed(visitor),
             active: CycleDetector::new(()),
         }
