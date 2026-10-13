@@ -1775,6 +1775,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         };
 
         // Aliases must use the same union and TypedDict checks as their underlying types.
+        // Preserve the declared receiver type when reporting an error on its expanded body.
+        let original_object_ty = object_ty;
         inspector.inspect(db, object_ty, |_, _| true, |inspector, object_ty| {
         match object_ty {
             Type::Union(union) => {
@@ -1792,7 +1794,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 for element_ty in union.elements(db) {
                     valid &= self.validate_subscript_assignment_in(inspector,
                         target,
-                        full_object_ty.or(Some(object_ty)),
+                        full_object_ty.or(Some(original_object_ty)),
                         *element_ty,
                         &mut |builder, tcx| infer_slice_ty.infer_silent(builder, tcx),
                         rhs_value_node,
@@ -1813,7 +1815,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     for element_ty in intersection.positive(db) {
                         valid |= self.validate_subscript_assignment_in(inspector,
                             target,
-                            full_object_ty.or(Some(object_ty)),
+                            full_object_ty.or(Some(original_object_ty)),
                             *element_ty,
                             &mut |builder, tcx| infer_slice_ty.infer_silent(builder, tcx),
                             rhs_value_node,
@@ -1890,7 +1892,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                                 on TypedDict `{}`",
                                 rhs_value_ty.display(db, env),
                                 slice_ty.display(db, env),
-                                object_ty.display(db, env),
+                                original_object_ty.display(db, env),
                             ));
                             diagnostic.set_primary_annotation_message(format_args!(
                                 "Expected value assignable to `{}`",
@@ -1903,7 +1905,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
                     let rhs_value_ty = infer_rhs_value(self, TypeContext::default());
                     let assigned_d = rhs_value_ty.display(db, env);
-                    let value_d = object_ty.display(db, env);
+                    let value_d = original_object_ty.display(db, env);
 
                     if slice_ty.is_assignable_to(db, env, Type::literal_string())
                         && !slice_ty.is_equivalent_to(db, env, Type::literal_string())
@@ -2015,7 +2017,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         {
                             let mut diagnostic = builder.into_diagnostic(format_args!(
                                 "Method `__setitem__` of type `{}` may be missing",
-                                object_ty.display(db, env),
+                                original_object_ty.display(db, env),
                             ));
                             attach_original_type_info(&mut diagnostic);
                         }
@@ -2035,7 +2037,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                                         "Method `__setitem__` of type `{}` is not callable \
                                              on object of type `{}`",
                                         bindings.callable_type().display(db, env),
-                                        object_ty.display(db, env),
+                                        original_object_ty.display(db, env),
                                     ));
                                     attach_original_type_info(&mut diagnostic);
                                 }
@@ -2069,12 +2071,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                                             DisplaySettings::from_possibly_ambiguous_types(
                                                 db,
                                                 env,
-                                                [rhs_value_ty, object_ty, slice_ty],
+                                                [rhs_value_ty, original_object_ty, slice_ty],
                                             );
                                         let assigned_d =
                                             rhs_value_ty.display_with(db, env, settings.clone());
                                         let object_d =
-                                            object_ty.display_with(db, env, settings.clone());
+                                            original_object_ty.display_with(db, env, settings.clone());
 
                                         let mut diagnostic = builder.into_diagnostic(format_args!(
                                             "Invalid subscript assignment with key of type `{}` \
@@ -2132,7 +2134,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                                         "Method `__setitem__` of type `{}` may not be callable \
                                         on object of type `{}`",
                                         bindings.callable_type().display(db, env),
-                                        object_ty.display(db, env),
+                                        original_object_ty.display(db, env),
                                     ));
                                     attach_original_type_info(&mut diagnostic);
                                 }
@@ -2147,7 +2149,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         {
                             let mut diagnostic = builder.into_diagnostic(format_args!(
                                 "Cannot assign to a subscript on an object of type `{}`",
-                                object_ty.display(db, env),
+                                original_object_ty.display(db, env),
                             ));
                             attach_original_type_info(&mut diagnostic);
 
@@ -2166,12 +2168,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             {
                                 diagnostic.help(format_args!(
                                     "Consider adding a `__setitem__` method to `{}`.",
-                                    object_ty.display(db, env),
+                                    original_object_ty.display(db, env),
                                 ));
                             } else {
                                 diagnostic.info(format_args!(
                                     "`{}` does not have a `__setitem__` method.",
-                                    object_ty.display(db, env),
+                                    original_object_ty.display(db, env),
                                 ));
                             }
                         }

@@ -650,7 +650,7 @@ enum IntersectionOn {
     Right,
 }
 
-/// A [`CycleDetector`] that is used in [`infer_binary_type_comparison`].
+/// State shared by recursive calls to [`infer_binary_type_comparison`].
 type BinaryComparisonVisitor<'env, 'db> = TypeVisitorState<
     'env,
     'db,
