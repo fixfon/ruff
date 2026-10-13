@@ -1,4 +1,5 @@
 use crate::ProgramEnvironment;
+use crate::types::recursive::TypeInspector;
 use compact_str::ToCompactString;
 use ruff_db::parsed::parsed_module;
 use ruff_python_ast::name::Name;
@@ -482,15 +483,32 @@ fn known_constructor_preserves_value_type<'db>(
     value: Type<'db>,
     annotation: Type<'db>,
 ) -> bool {
-    let annotation = annotation.resolve_type_alias(db);
-    match value.resolve_type_alias(db) {
-        Type::Union(union) => union
-            .elements(db)
-            .iter()
-            .all(|element| known_constructor_preserves_value_type(db, env, *element, annotation)),
-        Type::LiteralValue(literal) => literal.fallback_instance(db, env) == annotation,
-        value => value == annotation,
-    }
+    TypeInspector::scope(env, |inspector| {
+        known_constructor_preserves_value_type_in(db, inspector, value, annotation)
+    })
+}
+
+fn known_constructor_preserves_value_type_in<'db>(
+    db: &'db dyn Db,
+    inspector: &TypeInspector<'_, 'db>,
+    value: Type<'db>,
+    annotation: Type<'db>,
+) -> bool {
+    let env = inspector.environment();
+    inspector.inspect(
+        db,
+        value,
+        |_, _| false,
+        |inspector, value| match value {
+            Type::Union(union) => union.elements(db).iter().all(|element| {
+                known_constructor_preserves_value_type_in(db, inspector, *element, annotation)
+            }),
+            Type::LiteralValue(literal) => literal
+                .fallback_instance(db, env)
+                .is_same_resolved_type(db, annotation),
+            value => value.is_same_resolved_type(db, annotation),
+        },
+    )
 }
 
 /// Return whether constructing `data_type` from `value` preserves the value's inferred runtime
@@ -502,18 +520,35 @@ fn value_has_exact_known_class<'db>(
     value: Type<'db>,
     data_type: KnownClass,
 ) -> bool {
-    match value.resolve_type_alias(db) {
-        Type::Union(union) => union
-            .elements(db)
-            .iter()
-            .all(|element| value_has_exact_known_class(db, env, *element, data_type)),
-        Type::LiteralValue(literal) => match literal.fallback_instance(db, env) {
+    TypeInspector::scope(env, |inspector| {
+        value_has_exact_known_class_in(db, inspector, value, data_type)
+    })
+}
+
+fn value_has_exact_known_class_in<'db>(
+    db: &'db dyn Db,
+    inspector: &TypeInspector<'_, 'db>,
+    value: Type<'db>,
+    data_type: KnownClass,
+) -> bool {
+    let env = inspector.environment();
+    inspector.inspect(
+        db,
+        value,
+        |_, _| false,
+        |inspector, value| match value {
+            Type::Union(union) => union
+                .elements(db)
+                .iter()
+                .all(|element| value_has_exact_known_class_in(db, inspector, *element, data_type)),
+            Type::LiteralValue(literal) => match literal.fallback_instance(db, env) {
+                Type::NominalInstance(instance) => instance.has_known_class(db, data_type),
+                _ => false,
+            },
             Type::NominalInstance(instance) => instance.has_known_class(db, data_type),
             _ => false,
         },
-        Type::NominalInstance(instance) => instance.has_known_class(db, data_type),
-        _ => false,
-    }
+    )
 }
 
 impl<'db> EnumMetadata<'db> {

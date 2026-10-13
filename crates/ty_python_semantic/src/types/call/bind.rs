@@ -11,6 +11,7 @@
 mod constructor;
 mod property;
 
+use crate::types::recursive::TypeInspector;
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
@@ -177,6 +178,14 @@ fn generic_contexts_mentioned_in_type<'db>(
             false
         }
 
+        fn visit_recursive_type(
+            &self,
+            _db: &'db dyn Db,
+            _recursive: crate::types::RecursiveType<'db>,
+        ) {
+            self.notify_skipped_lazy_type_attributes();
+        }
+
         fn visit_callable_type(&self, db: &'db dyn Db, callable: CallableType<'db>) {
             for signature in &callable.signatures(db).overloads {
                 self.visit_signature(db, signature);
@@ -252,20 +261,28 @@ fn normalize_constraint_bound<'db>(
     if !typevar.is_paramspec(db) || typevar.paramspec_attr(db).is_some() {
         return Some(bound);
     }
-    match bound.resolve_type_alias(db) {
-        Type::Callable(callable)
-            if let [signature] = callable.signatures(db).overloads.as_slice()
-                && signature.generic_context.is_none()
-                && let Some(paramspec) = signature.parameters().as_paramspec() =>
-        {
-            Some(Type::TypeVar(paramspec))
-        }
-        Type::Callable(callable) => Some(Type::Callable(callable.into_paramspec_value(db))),
-        Type::TypeVar(bound) if bound.is_paramspec(db) && bound.paramspec_attr(db).is_none() => {
-            Some(Type::TypeVar(bound))
-        }
-        _ => None,
-    }
+    TypeInspector::inspect_root(
+        db,
+        env,
+        bound,
+        |_, _| None,
+        |_, bound| match bound {
+            Type::Callable(callable)
+                if let [signature] = callable.signatures(db).overloads.as_slice()
+                    && signature.generic_context.is_none()
+                    && let Some(paramspec) = signature.parameters().as_paramspec() =>
+            {
+                Some(Type::TypeVar(paramspec))
+            }
+            Type::Callable(callable) => Some(Type::Callable(callable.into_paramspec_value(db))),
+            Type::TypeVar(bound)
+                if bound.is_paramspec(db) && bound.paramspec_attr(db).is_none() =>
+            {
+                Some(Type::TypeVar(bound))
+            }
+            _ => None,
+        },
+    )
 }
 
 /// Priority levels for call errors in intersection types.
@@ -703,6 +720,7 @@ impl<'db> Bindings<'db> {
     fn set_constructor_instance_type_in_place(
         &mut self,
         db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
         constructor_instance_type: Type<'db>,
     ) {
         for element in &mut self.elements {
@@ -713,7 +731,7 @@ impl<'db> Bindings<'db> {
                         binding.set_constructed_instance_type(constructor_instance_type);
                         let constructor_context = binding.context();
                         for overload in &mut binding.entry.overloads {
-                            overload.set_constructor_context(db, constructor_context);
+                            overload.set_constructor_context(db, env, constructor_context);
                         }
 
                         // Deferred downstream constructor bindings still need constructor instance
@@ -722,6 +740,7 @@ impl<'db> Bindings<'db> {
                         if let Some(downstream) = binding.downstream_constructor_mut() {
                             downstream.set_constructor_instance_type_in_place(
                                 db,
+                                env,
                                 constructor_instance_type,
                             );
                         }
@@ -860,9 +879,10 @@ impl<'db> Bindings<'db> {
     pub(crate) fn with_constructed_instance_type(
         mut self,
         db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
         constructor_instance_type: Type<'db>,
     ) -> Self {
-        self.set_constructor_instance_type_in_place(db, constructor_instance_type);
+        self.set_constructor_instance_type_in_place(db, env, constructor_instance_type);
         self
     }
 
@@ -3585,7 +3605,7 @@ impl<'db> CallableBinding<'db> {
                 Some(bound_self),
                 Some(typing_self),
             );
-            overload.return_ty = overload.initial_return_type(db);
+            overload.return_ty = overload.initial_return_type(db, env);
             overload.source_parameter_index_offset += usize::from(removed_receiver);
         }
     }
@@ -4081,7 +4101,7 @@ impl<'db> CallableBinding<'db> {
                 // https://github.com/astral-sh/ty/issues/735 for more details.
                 for overload in &mut self.overloads {
                     // Clear the state of all overloads before re-evaluating from step 1
-                    overload.reset(db);
+                    overload.reset(db, env);
                     overload.match_parameters(db, env, expanded_arguments);
                 }
 
@@ -5970,22 +5990,29 @@ impl<'db> ArgumentTypeChecker<'_, 'db> {
                                     })
                                 })
                         };
-                        let prefix_len =
-                            if let Type::Union(union) = declared_type.resolve_type_alias(db) {
-                                union.elements(db).iter().find_map(|candidate| {
-                                    let specialized_candidate = candidate
-                                        .apply_optional_specialization(
-                                            db,
-                                            self.merged_specialization(),
-                                        );
-                                    argument_type
-                                        .is_assignable_to(db, env, specialized_candidate)
-                                        .then_some(*candidate)
-                                        .and_then(paramspec_prefix_len)
-                                })
-                            } else {
-                                paramspec_prefix_len(declared_type)
-                            }?;
+                        let prefix_len = TypeInspector::inspect_root(
+                            db,
+                            env,
+                            declared_type,
+                            |_, _| None,
+                            |_, declared_type| {
+                                if let Type::Union(union) = declared_type {
+                                    union.elements(db).iter().find_map(|candidate| {
+                                        let specialized_candidate = candidate
+                                            .apply_optional_specialization(
+                                                db,
+                                                self.merged_specialization(),
+                                            );
+                                        argument_type
+                                            .is_assignable_to(db, env, specialized_candidate)
+                                            .then_some(*candidate)
+                                            .and_then(paramspec_prefix_len)
+                                    })
+                                } else {
+                                    paramspec_prefix_len(declared_type)
+                                }
+                            },
+                        )?;
                         let (source_type, partial_signature) = match argument_type {
                             Type::KnownInstance(
                                 KnownInstanceType::FunctoolsPartial(partial)
@@ -6696,7 +6723,7 @@ impl<'db> CallInference<'_, 'db> {
             && provided
                 .variable()
                 .homogeneous_type()
-                .is_some_and(|element| !element.resolve_type_alias(db).is_never())
+                .is_some_and(|element| !element.has_outer_type(db, |ty| ty.is_never()))
         {
             // Expose required boundaries without discarding fixed values the splat already has.
             let target_length = TupleLength::Variable(
@@ -6837,10 +6864,11 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
         // constraint set, so decorator-scoped receiver variables are not rechecked independently.
         let constructor_receiver = matches!(argument, Argument::Synthetic)
             && self.constructor_kind == Some(ConstructorCallableKind::New)
-            && matches!(
-                parameter.annotated_type().resolve_type_alias(db),
-                Type::SubclassOf(subclass_of) if subclass_of.into_type_var().is_some()
-            );
+            && parameter.annotated_type().has_outer_type(db, |ty| {
+                matches!(ty,
+                    Type::SubclassOf(subclass_of) if subclass_of.into_type_var().is_some()
+                )
+            });
 
         let mut expected_ty = declared_type;
         if let Some(specialization) = self.merged_specialization() {
@@ -6862,6 +6890,7 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                     Some(KnownFunction::IsInstance | KnownFunction::IsSubclass)
                 )
                 && ClassInfoValidator {
+                    mapping: ApplyTypeMappingVisitor::new(self.env),
                     env: self.env,
                     expected: expected_ty,
                     visitor: CycleDetector::new(true),
@@ -7573,6 +7602,14 @@ fn inferable_typevar_occurrences<'db>(
             false
         }
 
+        fn visit_recursive_type(
+            &self,
+            _db: &'db dyn Db,
+            _recursive: crate::types::RecursiveType<'db>,
+        ) {
+            self.notify_skipped_lazy_type_attributes();
+        }
+
         fn visit_type(&self, db: &'db dyn Db, ty: Type<'db>) {
             if let Type::TypeVar(typevar) = ty {
                 let identity = if typevar.is_paramspec(db) {
@@ -8119,7 +8156,7 @@ impl<'db> Binding<'db> {
         if let Some(declared_return_ty) = call_expression_tcx.annotation {
             let inferable = generic_context.inferable_typevars(db);
             let normalized_return_ty = self
-                .normalized_constructor_return(db)
+                .normalized_constructor_return(db, env)
                 .unwrap_or(self.signature.return_ty);
             let path_bounds = normalized_return_ty.assignable_solutions_with_inferable(
                 db,
@@ -8232,7 +8269,7 @@ impl<'db> Binding<'db> {
             return;
         }
         self.signature = self.signature.freshen_bound_typevars(db, env, delta);
-        self.return_ty = self.initial_return_type(db);
+        self.return_ty = self.initial_return_type(db, env);
     }
 
     fn match_parameters(
@@ -8528,7 +8565,7 @@ impl<'db> Binding<'db> {
             env,
             &partial_application,
             self.inference,
-            self.unspecialized_return_type(db),
+            self.unspecialized_return_type(db, env),
         );
 
         if signature.parameters() == self.signature.parameters() {
@@ -8691,8 +8728,8 @@ impl<'db> Binding<'db> {
     }
 
     /// Resets the state of this binding to its initial state.
-    fn reset(&mut self, db: &'db dyn Db) {
-        self.return_ty = self.initial_return_type(db);
+    fn reset(&mut self, db: &'db dyn Db, env: &ProgramEnvironment<'db>) {
+        self.return_ty = self.initial_return_type(db, env);
         self.inferable_typevars = TypeVarSet::None;
         self.inference = None;
         self.argument_matches = Box::from([]);
@@ -10421,6 +10458,7 @@ fn all_arguments_range(node: AnyNodeRef) -> TextRange {
 
 /// Validate class-info values, including typing special forms in nested tuples.
 struct ClassInfoValidator<'a, 'db> {
+    mapping: ApplyTypeMappingVisitor<'a, 'db>,
     env: &'a ProgramEnvironment<'db>,
     expected: Type<'db>,
     visitor: CycleDetector<'db, KnownFunction, Type<'db>, bool, 1>,
@@ -10430,11 +10468,12 @@ struct ClassInfoValidator<'a, 'db> {
 impl<'db> ClassInfoValidator<'_, 'db> {
     fn validate(&self, db: &'db dyn Db, ty: Type<'db>) -> bool {
         self.visitor
-            .try_visit(
+            .try_visit_with_expansion(
                 db,
                 ty,
+                &self.mapping,
                 |_| true,
-                || self.validate_impl(db, ty, |ty| self.validate(db, ty)),
+                |expansion| self.validate_impl(db, ty, expansion, |ty| self.validate(db, ty)),
             )
             .unwrap_or_else(|ty| self.validate_constructor(db, ty))
     }
@@ -10456,24 +10495,24 @@ impl<'db> ClassInfoValidator<'_, 'db> {
                 }
                 _ => ty,
             };
-        self.constructors.visit(db, ty, || {
-            self.validate_impl(db, ty, |ty| self.validate_constructor(db, ty))
-        })
+        self.constructors
+            .visit_with_expansion(db, ty, &self.mapping, |expansion| {
+                self.validate_impl(db, ty, expansion, |ty| self.validate_constructor(db, ty))
+            })
     }
 
     fn validate_impl(
         &self,
         db: &'db dyn Db,
         ty: Type<'db>,
+        expansion: &crate::types::recursive::TypeExpansionContext<'_, '_, 'db>,
         mut validate: impl FnMut(Type<'db>) -> bool,
     ) -> bool {
         match ty {
             Type::SpecialForm(special) if special.is_valid_isinstance_target() => true,
             Type::Union(union) => union.elements(db).iter().copied().all(validate),
             Type::TypeAlias(alias) => validate(alias.value_type(db)),
-            Type::Recursive(recursive) => recursive
-                .unfold(db, &ApplyTypeMappingVisitor::new(self.env))
-                .is_unfolded_and(validate),
+            Type::Recursive(recursive) => expansion.unfold(db, recursive).is_unfolded_and(validate),
             _ => {
                 if let Some(tuple) = ty.tuple_instance_spec(db, self.env) {
                     tuple.iter_element_types(db).all(validate)

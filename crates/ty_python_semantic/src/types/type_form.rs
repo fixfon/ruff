@@ -42,9 +42,7 @@ impl<'db> Type<'db> {
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
     ) -> Type<'db> {
-        TypeTraversal::new(env, TypeFormArgument)
-            .visit(db, self)
-            .unwrap_or(self)
+        TypeTraversal::with_root(env, TypeFormArgument, |root| root.visit(db, self)).unwrap_or(self)
     }
 }
 

@@ -702,8 +702,11 @@ impl<'db> SemanticModel<'db> {
         let expected_ty = self.string_literal_completion_expected_type(string_expr);
         let mut candidates = expected_ty
             .map(|expected_ty| {
-                TypeTraversal::new(&self.program_environment(), StringLiteralCandidates)
-                    .visit(db, expected_ty)
+                TypeTraversal::with_root(
+                    &self.program_environment(),
+                    StringLiteralCandidates,
+                    |root| root.visit(db, expected_ty),
+                )
             })
             .unwrap_or_default();
         // Finite choices from the expected type take precedence. A string used as the complete

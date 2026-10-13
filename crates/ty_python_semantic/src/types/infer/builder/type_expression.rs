@@ -1,3 +1,4 @@
+use crate::types::recursive::TypeInspector;
 use itertools::Either;
 use ruff_db::diagnostic::Annotation;
 use ruff_db::parsed::parsed_module;
@@ -34,11 +35,11 @@ use ty_python_core::place_table;
 use ty_python_core::scope::ScopeKind;
 
 use crate::types::{
-    ApplyTypeMappingVisitor, BindingContext, CallableType, DynamicType, GenericContext,
-    IntersectionBuilder, IntersectionType, InvalidTypeExpression, KnownClass, KnownInstanceType,
-    LintDiagnosticGuard, Parameter, Parameters, SpecialFormType, SubclassOfType, Type, TypeContext,
-    TypeFormType, TypeGuardType, TypeIsType, TypeMapping, TypeVarKind, UnionBuilder, UnionType,
-    any_over_type, binding_type, todo_type,
+    BindingContext, CallableType, DynamicType, GenericContext, IntersectionBuilder,
+    IntersectionType, InvalidTypeExpression, KnownClass, KnownInstanceType, LintDiagnosticGuard,
+    Parameter, Parameters, SpecialFormType, SubclassOfType, Type, TypeContext, TypeFormType,
+    TypeGuardType, TypeIsType, TypeMapping, TypeVarKind, UnionBuilder, UnionType, any_over_type,
+    binding_type, todo_type,
 };
 use crate::{FxOrderSet, SemanticModel, add_inferred_python_version_hint_to_diagnostic};
 
@@ -1260,6 +1261,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
 
     fn infer_starred_type_expression(&mut self, starred: &ast::ExprStarred) -> Type<'db> {
         let db = self.db();
+        let env = self.program_environment();
         let ast::ExprStarred {
             range: _,
             node_index: _,
@@ -1273,33 +1275,43 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             .context
             .inference_flags
             .replace(InferenceFlags::IN_UNPACK_TYPE_ARGUMENT, true);
-        let starred_type = self.infer_type_expression(value).resolve_type_alias(db);
+        let starred_type = self.infer_type_expression(value);
         self.context.inference_flags.set(
             InferenceFlags::IN_UNPACK_TYPE_ARGUMENT,
             previously_in_unpack_type_argument,
         );
 
-        if starred_type.exact_tuple_instance_spec(self.db()).is_some()
-            || matches!(
-                starred_type,
-                Type::TypeVar(typevar) if typevar.is_typevartuple(self.db())
-            )
-        {
-            starred_type
-        } else {
-            self.store_type_expression_flags(
-                ast::ExprRef::from(starred),
-                TypeExpressionFlags::INVALID_UNPACK,
-            );
-            if !starred_type.is_unknown()
-                && let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, starred)
-            {
-                diagnostic::add_type_expression_reference_link(
-                    builder.into_diagnostic("`*` can only unpack a tuple type or `TypeVarTuple`"),
-                );
-            }
-            Type::homogeneous_tuple(db, self.program_environment(), Type::unknown())
-        }
+        TypeInspector::inspect_root(
+            db,
+            env,
+            starred_type,
+            |_, _| Type::homogeneous_tuple(db, env, Type::unknown()),
+            |_, starred_type| {
+                if starred_type.exact_tuple_instance_spec(self.db()).is_some()
+                    || matches!(
+                        starred_type,
+                        Type::TypeVar(typevar) if typevar.is_typevartuple(self.db())
+                    )
+                {
+                    starred_type
+                } else {
+                    self.store_type_expression_flags(
+                        ast::ExprRef::from(starred),
+                        TypeExpressionFlags::INVALID_UNPACK,
+                    );
+                    if !starred_type.is_unknown()
+                        && let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, starred)
+                    {
+                        diagnostic::add_type_expression_reference_link(
+                            builder.into_diagnostic(
+                                "`*` can only unpack a tuple type or `TypeVarTuple`",
+                            ),
+                        );
+                    }
+                    Type::homogeneous_tuple(db, self.program_environment(), Type::unknown())
+                }
+            },
+        )
     }
 
     pub(super) fn infer_subscript_type_expression_no_store(
@@ -1593,19 +1605,26 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         };
 
         let subclass_of_type_argument = |builder: &Self, slice: &ast::Expr, slice_ty: Type<'db>| {
-            let slice_ty = slice_ty.resolve_type_alias(db);
-            let slice_ty = match slice_ty {
-                Type::Union(union) if union.has_aliases(builder.db()) => {
-                    union.expand_aliases(db, &ApplyTypeMappingVisitor::new(env))
-                }
-                _ => slice_ty,
-            };
-            SubclassOfType::try_from_instance(db, env, slice_ty).unwrap_or_else(|unsupported| {
-                match unsupported {
-                    Type::Callable(_) => invalid_type_argument(builder, slice),
-                    _ => todo_type!("unsupported type[X] special form"),
-                }
-            })
+            TypeInspector::inspect_root(
+                db,
+                env,
+                slice_ty,
+                |_, _| todo_type!("unsupported type[X] special form"),
+                |inspector, slice_ty| {
+                    let slice_ty = match slice_ty {
+                        Type::Union(union) if union.has_aliases(db) => {
+                            union.expand_aliases(db, inspector.mapping_visitor())
+                        }
+                        _ => slice_ty,
+                    };
+                    SubclassOfType::try_from_instance(db, env, slice_ty).unwrap_or_else(
+                        |unsupported| match unsupported {
+                            Type::Callable(_) => invalid_type_argument(builder, slice),
+                            _ => todo_type!("unsupported type[X] special form"),
+                        },
+                    )
+                },
+            )
         };
 
         let infer_type_argument = |builder: &mut Self, slice: &ast::Expr| {
@@ -2871,32 +2890,40 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                     return inner_ty;
                 }
 
-                let inner_ty = inner_ty.resolve_type_alias(db);
-
-                // Preserve valid unpack targets so that `Unpack[...]` follows the same
-                // argument-binding path as an equivalent starred annotation.
-                if inner_ty.exact_tuple_instance_spec(self.db()).is_some()
-                    || matches!(
-                        inner_ty,
-                        Type::TypeVar(typevar) if typevar.is_typevartuple(self.db())
-                    )
-                {
-                    inner_ty
-                } else {
-                    self.store_type_expression_flags(
-                        ast::ExprRef::from(subscript),
-                        TypeExpressionFlags::INVALID_UNPACK,
-                    );
-                    if !inner_ty.is_unknown()
-                        && let Some(builder) =
-                            self.context.report_lint(&INVALID_TYPE_FORM, subscript)
-                    {
-                        diagnostic::add_type_expression_reference_link(builder.into_diagnostic(
-                            "`Unpack` can only unpack a tuple type or `TypeVarTuple`",
-                        ));
-                    }
-                    Type::homogeneous_tuple(db, env, Type::unknown())
-                }
+                TypeInspector::inspect_root(
+                    db,
+                    env,
+                    inner_ty,
+                    |_, _| Type::homogeneous_tuple(db, env, Type::unknown()),
+                    |_, inner_ty| {
+                        // Preserve valid unpack targets so that `Unpack[...]` follows the same
+                        // argument-binding path as an equivalent starred annotation.
+                        if inner_ty.exact_tuple_instance_spec(self.db()).is_some()
+                            || matches!(
+                                inner_ty,
+                                Type::TypeVar(typevar) if typevar.is_typevartuple(self.db())
+                            )
+                        {
+                            inner_ty
+                        } else {
+                            self.store_type_expression_flags(
+                                ast::ExprRef::from(subscript),
+                                TypeExpressionFlags::INVALID_UNPACK,
+                            );
+                            if !inner_ty.is_unknown()
+                                && let Some(builder) =
+                                    self.context.report_lint(&INVALID_TYPE_FORM, subscript)
+                            {
+                                diagnostic::add_type_expression_reference_link(
+                                    builder.into_diagnostic(
+                                        "`Unpack` can only unpack a tuple type or `TypeVarTuple`",
+                                    ),
+                                );
+                            }
+                            Type::homogeneous_tuple(db, env, Type::unknown())
+                        }
+                    },
+                )
             }
             SpecialFormType::NoReturn
             | SpecialFormType::Never
@@ -3169,7 +3196,11 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                     previously_in_valid_unpack_context,
                 );
 
-                return Some(Parameters::from_annotation(db, parameters));
+                return Some(Parameters::from_annotation(
+                    db,
+                    self.program_environment(),
+                    parameters,
+                ));
             }
             ast::Expr::Subscript(subscript) => {
                 let value_ty = self.infer_expression(&subscript.value, TypeContext::default());

@@ -20,6 +20,7 @@ use crate::types::constraints::{
 };
 use crate::types::cyclic::{ActiveRecursionDetector, CycleDetector, HasIdentity, TypeIdentity};
 use crate::types::infer::original_class_type;
+use crate::types::recursive::{TypeExpansionContext, TypeInspector};
 use crate::types::relation::{
     DisjointnessChecker, HasRelationToVisitor, IsDisjointVisitor, TypeRelation,
     TypeRelationChecker, TypeVarEvaluation,
@@ -747,6 +748,7 @@ impl<'db> GenericContext<'db> {
         /// whether each typevar appears inside and/or outside of a return type `Callable`.
         struct FindTypeVarLocations<'a, 'db> {
             env: &'a ProgramEnvironment<'db>,
+            mapping: ApplyTypeMappingVisitor<'a, 'db>,
             locations: RefCell<TypeVarLocations<'db>>,
             recursion_guard: TypeCollector<'db>,
             active_aliases: ActiveRecursionDetector<TypeIdentity<'db>>,
@@ -813,16 +815,12 @@ impl<'db> GenericContext<'db> {
             }
 
             fn visit_recursive_type(&self, db: &'db dyn Db, recursive: RecursiveType<'db>) {
-                self.active_aliases.visit(
+                self.active_aliases.visit_with_expansion(
                     &Type::Recursive(recursive).to_type_identity(db),
+                    &self.mapping,
                     || (),
-                    || {
-                        self.visit_type(
-                            db,
-                            recursive
-                                .unfold(db, &ApplyTypeMappingVisitor::new(self.env))
-                                .into_type(),
-                        );
+                    |expansion| {
+                        self.visit_type(db, expansion.unfold(db, recursive).into_type());
                     },
                 );
             }
@@ -842,6 +840,7 @@ impl<'db> GenericContext<'db> {
         // Find whether each typevar appears inside and/or outside a return type Callable.
         let mut find_typevar_locations = FindTypeVarLocations {
             env: &env,
+            mapping: ApplyTypeMappingVisitor::new(&env),
             locations: RefCell::default(),
             recursion_guard: TypeCollector::default(),
             active_aliases: ActiveRecursionDetector::default(),
@@ -1687,7 +1686,7 @@ impl<'db> Specialization<'db> {
         env: &ProgramEnvironment<'db>,
         binding_context: Option<Definition<'db>>,
         typevars: &mut FxOrderSet<BoundTypeVarInstance<'db>>,
-        visitor: &FindLegacyTypeVarsVisitor<'db>,
+        visitor: &FindLegacyTypeVarsVisitor<'_, 'db>,
     ) {
         if let Some(tuple) = self.tuple_inner(db) {
             tuple.find_legacy_typevars_impl(db, env, binding_context, typevars, visitor);
@@ -2196,8 +2195,8 @@ impl<'c, 'db> DisjointnessChecker<'_, 'c, 'db> {
             self.constraints,
             |(bound_typevar, left_type, right_type)| match bound_typevar.variance(db) {
                 TypeVarVariance::Invariant => {
-                    let left_type = left_type.resolve_type_alias(db);
-                    let right_type = right_type.resolve_type_alias(db);
+                    let left_type = *left_type;
+                    let right_type = *right_type;
 
                     // `Bottom[L] <: Top[R]` asks whether the materialization ranges for `L`
                     // and `R` have any common materialization, so this is symmetric despite
@@ -2437,13 +2436,27 @@ impl<'db> Type<'db> {
 }
 
 /// Tracks recursive inference separately for each pair of types and variance polarity.
-type InferSpecializationVisitor<'db> = CycleDetector<
+type InferSpecializationCycles<'db> = CycleDetector<
     'db,
     InferSpecialization<'db>,
     InferSpecialization<'db>,
     Result<(), SpecializationError<'db>>,
     1,
 >;
+
+struct InferSpecializationVisitor<'env, 'db> {
+    cycles: InferSpecializationCycles<'db>,
+    mapping: ApplyTypeMappingVisitor<'env, 'db>,
+}
+
+impl<'env, 'db> InferSpecializationVisitor<'env, 'db> {
+    fn new(env: &'env ProgramEnvironment<'db>) -> Self {
+        Self {
+            cycles: InferSpecializationCycles::new(Ok(())),
+            mapping: ApplyTypeMappingVisitor::new(env),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct InferSpecialization<'db> {
@@ -3677,11 +3690,17 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
             env: &ProgramEnvironment<'db>,
             ty: Type<'db>,
         ) -> bool {
-            let Type::NominalInstance(instance) = ty.resolve_type_alias(db) else {
-                return false;
-            };
+            TypeInspector::inspect_root(
+                db,
+                env,
+                ty,
+                |_, _| false,
+                |_, ty| {
+                    let Type::NominalInstance(instance) = ty else {
+                        return false;
+                    };
 
-            matches!(
+                    matches!(
                 instance.class(db, env).known(db),
                 Some(
                     KnownClass::Dict
@@ -3697,9 +3716,11 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                 .is_some_and(|alias| {
                     matches!(
                         alias.specialization(db).types(db),
-                        [key, _] if key.resolve_type_alias(db) == KnownClass::Str.to_instance(db, env)
+                        [key, _] if key.is_same_resolved_type(db, KnownClass::Str.to_instance(db, env))
                     )
                 })
+                },
+            )
         }
 
         #[derive(Default)]
@@ -3746,16 +3767,17 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                         .all(|element| traversal.visit_with(db, *element, &mut *types)),
                     Type::Intersection(intersection)
                         if intersection.negative(db).is_empty()
-                            && intersection
-                                .iter_positive(db)
-                                .any(|element| element.resolve_type_alias(db).is_typed_dict())
+                            && intersection.iter_positive(db).any(|element| {
+                                element.has_outer_type(db, |ty| ty.is_typed_dict())
+                            })
                             && intersection.iter_positive(db).all(|element| {
-                                let element = element.resolve_type_alias(db);
-                                element.is_typed_dict()
-                                    || element
-                                        == KnownClass::Dict
+                                element.has_outer_type(db, |ty| ty.is_typed_dict())
+                                    || element.is_same_resolved_type(
+                                        db,
+                                        KnownClass::Dict
                                             .to_instance_unknown(db, env)
-                                            .top_materialization(db, env)
+                                            .top_materialization(db, env),
+                                    )
                             }) =>
                     {
                         // `isinstance(value, dict)` narrows a `TypedDict` to an intersection with
@@ -3770,12 +3792,13 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                                 .iter_positive(db)
                                 .any(|element| is_string_keyed_mapping(db, env, element))
                             && intersection.iter_positive(db).all(|element| {
-                                let element = element.resolve_type_alias(db);
                                 is_string_keyed_mapping(db, env, element)
-                                    || element
-                                        == KnownClass::Dict
+                                    || element.is_same_resolved_type(
+                                        db,
+                                        KnownClass::Dict
                                             .to_instance_unknown(db, env)
-                                            .top_materialization(db, env)
+                                            .top_materialization(db, env),
+                                    )
                             }) =>
                     {
                         // `isinstance(value, dict)` can also narrow a mapping to an intersection with
@@ -3798,11 +3821,9 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
 
         let env = self.env;
         let mut types = MappingUnionTypes::default();
-        if !TypeTraversal::new(env, CollectMappingUnionTypes).visit_with(
-            db,
-            Type::Union(actual),
-            &mut types,
-        ) {
+        if !TypeTraversal::with_root(env, CollectMappingUnionTypes, |root| {
+            root.visit_with(db, Type::Union(actual), &mut types)
+        }) {
             return None;
         }
         let MappingUnionTypes {
@@ -3957,7 +3978,7 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
             formal,
             actual,
             TypeVarVariance::Covariant,
-            &InferSpecializationVisitor::new(Ok(())),
+            &InferSpecializationVisitor::new(self.env),
         )
     }
 
@@ -3966,7 +3987,7 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
         formal: Type<'db>,
         actual: Type<'db>,
         polarity: TypeVarVariance,
-        visitor: &InferSpecializationVisitor<'db>,
+        visitor: &InferSpecializationVisitor<'_, 'db>,
     ) -> Result<(), SpecializationError<'db>> {
         if formal == actual {
             return Ok(());
@@ -3978,9 +3999,11 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
             polarity,
             generic_context: self.generic_context,
         };
-        visitor.visit(self.db, comparison, || {
-            self.infer_map_inner(formal, actual, polarity, visitor)
-        })
+        visitor
+            .cycles
+            .visit_with_expansion(self.db, comparison, &visitor.mapping, |expansion| {
+                self.infer_map_inner(formal, actual, polarity, visitor, expansion)
+            })
     }
 
     /// Infer constraints for a pair already protected by `infer_map_impl`'s recursion guard.
@@ -3989,7 +4012,8 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
         formal: Type<'db>,
         actual: Type<'db>,
         polarity: TypeVarVariance,
-        visitor: &InferSpecializationVisitor<'db>,
+        visitor: &InferSpecializationVisitor<'_, 'db>,
+        expansion: &TypeExpansionContext<'_, '_, 'db>,
     ) -> Result<(), SpecializationError<'db>> {
         let db = self.db;
         // TODO: Eventually, the builder will maintain a constraint set, instead of a hash-map of
@@ -4013,7 +4037,7 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
         //
         // If no elements survive, keep the original union: inferring from `Never` would discard
         // its type variables and skip the bound checks that reject the argument.
-        let actual = if actual.resolve_type_alias(db).is_union() {
+        let actual = if expansion.resolve_aliases(db, actual).is_union() {
             let formal = formal
                 .apply_specialization(db, self.generic_context.unknown_specialization(db, None));
             actual
@@ -4058,9 +4082,7 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
             }
             (Type::Recursive(recursive), _) => {
                 return self.infer_map_impl(
-                    recursive
-                        .unfold(db, &ApplyTypeMappingVisitor::new(self.env))
-                        .into_type(),
+                    expansion.unfold(db, recursive).into_type(),
                     actual,
                     polarity,
                     visitor,
@@ -4797,9 +4819,7 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
             (formal, Type::Recursive(recursive)) => {
                 return self.infer_map_impl(
                     formal,
-                    recursive
-                        .unfold(db, &ApplyTypeMappingVisitor::new(self.env))
-                        .into_type(),
+                    expansion.unfold(db, recursive).into_type(),
                     polarity,
                     visitor,
                 );

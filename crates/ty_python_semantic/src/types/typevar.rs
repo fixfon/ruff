@@ -472,6 +472,8 @@ impl<'db> TypeVarInstance<'db> {
             visitor: &'a TypeVarDefaultVisitor<'db>,
             seen_typevars: &'a RefCell<FxHashSet<TypeVarInstance<'db>>>,
             seen_types: &'a RefCell<SeenTypes<'db>>,
+            recursive:
+                &'a crate::types::recursive::TypeVisitorState<'a, 'db, (), Type<'db>, bool, 1>,
         }
 
         fn typevar_default_is_self_referential<'db>(
@@ -573,13 +575,15 @@ impl<'db> TypeVarInstance<'db> {
                         }
                         seen_types.push(identity);
                     }
-                    type_is_self_referential_impl(
-                        state,
-                        recursive
-                            .unfold(db, &ApplyTypeMappingVisitor::new(state.env))
-                            .into_type(),
-                        self_identity,
-                    )
+                    state
+                        .recursive
+                        .visit_with_expansion(db, inner_ty, |expansion| {
+                            type_is_self_referential_impl(
+                                state,
+                                expansion.unfold(db, recursive).into_type(),
+                                self_identity,
+                            )
+                        })
                 }
                 Type::KnownInstance(KnownInstanceType::TypeAliasType(alias)) => {
                     type_alias_is_self_referential(state, alias, self_identity)
@@ -591,7 +595,9 @@ impl<'db> TypeVarInstance<'db> {
         let seen_typevars = RefCell::new(FxHashSet::default());
         let seen_types = RefCell::new(SeenTypes::new());
 
+        let recursive = crate::types::recursive::TypeVisitorState::new(env, false);
         let state = State {
+            recursive: &recursive,
             db,
             env,
             visitor,
@@ -983,6 +989,14 @@ pub(crate) fn max_typevar_freshness_matching_generic_context<'db>(
 
         fn should_visit_lazy_type_attributes(&self) -> bool {
             false
+        }
+
+        fn visit_recursive_type(
+            &self,
+            _db: &'db dyn Db,
+            _recursive: crate::types::RecursiveType<'db>,
+        ) {
+            self.notify_skipped_lazy_type_attributes();
         }
 
         fn visit_bound_type_var_type(

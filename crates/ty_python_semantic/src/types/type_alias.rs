@@ -130,6 +130,7 @@ impl<'db> AliasCycleSummary<'db> {
 /// Remove unguarded recursive edges while retaining the other union alternatives.
 struct AliasCycleRecovery<'a, 'db> {
     env: &'a ProgramEnvironment<'db>,
+    mapping: ApplyTypeMappingVisitor<'a, 'db>,
     context: Option<&'a TypeRecursionContext<'db>>,
     cycle: Type<'db>,
     visitor: CycleDetector<'db, AliasCycleSummary<'db>, Type<'db>, Option<Type<'db>>, 1>,
@@ -151,18 +152,12 @@ impl<'db> AliasCycleRecovery<'_, 'db> {
                 );
                 self.recover(db, value)
             }),
-            Type::Recursive(recursive) => self.visitor.visit(db, ty, || {
-                self.recover(
-                    db,
-                    recursive
-                        .unfold(
-                            db,
-                            &ApplyTypeMappingVisitor::new(self.env)
-                                .with_recursion_context(self.context),
-                        )
-                        .into_unfolded()?,
-                )
-            }),
+            Type::Recursive(recursive) => {
+                self.visitor
+                    .visit_with_expansion(db, ty, &self.mapping, |expansion| {
+                        self.recover(db, expansion.unfold(db, recursive).into_unfolded()?)
+                    })
+            }
             Type::Union(union) => {
                 let elements: Vec<_> = union
                     .elements(db)
@@ -538,6 +533,7 @@ impl<'db> TypeAliasType<'db> {
             let env = ProgramEnvironment::from_definition(self.definition(db));
             return AliasCycleRecovery {
                 env: &env,
+                mapping: ApplyTypeMappingVisitor::new(&env).with_recursion_context(context),
                 context,
                 cycle,
                 visitor: CycleDetector::new(None),

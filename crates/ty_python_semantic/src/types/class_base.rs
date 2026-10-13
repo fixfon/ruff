@@ -148,7 +148,9 @@ impl<'db> ClassBase<'db> {
         ty: Type<'db>,
         subclass: Option<ClassLiteral<'db>>,
     ) -> Option<Self> {
-        TypeTraversal::new(env, ResolveClassBase { subclass }).visit(db, ty)
+        TypeTraversal::with_root(env, ResolveClassBase { subclass }, |root| {
+            root.visit(db, ty)
+        })
     }
 
     pub(super) fn into_class(self) -> Option<ClassType<'db>> {

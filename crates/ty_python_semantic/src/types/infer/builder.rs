@@ -1,3 +1,4 @@
+use crate::types::recursive::TypeInspector;
 use std::cell::{OnceCell, RefCell};
 use std::collections::hash_map;
 use std::convert::Infallible;
@@ -126,15 +127,15 @@ use crate::types::unpacker::{
     tuple_literal_needs_promotion,
 };
 use crate::types::{
-    ApplyTypeMappingVisitor, BindingContext, BoundTypeVarInstance, CallDunderError,
-    CallableBinding, CallableType, ClassType, CycleKind, DynamicType, GeneratorTypeMode,
-    InferenceFlags, InternedConstraintSet, InternedType, IntersectionBuilder, IntersectionType,
-    KnownBoundMethodType, KnownClass, KnownInstanceType, KnownUnion, LiteralValueType,
-    LiteralValueTypeKind, MemberLookupPolicy, ParamSpecAttrKind, Parameter, Parameters,
-    ProgramEnvironment, PropertyDeprecations, SentinelInstance, Signature, SpecialFormType,
-    SubclassOfType, Type, TypeAliasType, TypeAndQualifiers, TypeContext, TypeOperation,
-    TypeQualifiers, TypeTraversal, TypeVarBoundOrConstraints, TypeVarKind, TypeVarVariance,
-    TypingModule, UnionAccumulator, UnionBuilder, UnionType, any_over_type, binding_type,
+    BindingContext, BoundTypeVarInstance, CallDunderError, CallableBinding, CallableType,
+    ClassType, CycleKind, DynamicType, GeneratorTypeMode, InferenceFlags, InternedConstraintSet,
+    InternedType, IntersectionBuilder, IntersectionType, KnownBoundMethodType, KnownClass,
+    KnownInstanceType, KnownUnion, LiteralValueType, LiteralValueTypeKind, MemberLookupPolicy,
+    ParamSpecAttrKind, Parameter, Parameters, ProgramEnvironment, PropertyDeprecations,
+    SentinelInstance, Signature, SpecialFormType, SubclassOfType, Type, TypeAliasType,
+    TypeAndQualifiers, TypeContext, TypeOperation, TypeQualifiers, TypeTraversal,
+    TypeVarBoundOrConstraints, TypeVarKind, TypeVarVariance, TypingModule, UnionAccumulator,
+    UnionBuilder, UnionType, any_over_type, binding_type,
     extract_fixed_length_iterable_element_types, infer_complete_scope_types, infer_scope_types,
     is_discarded_dict_key_assignment, todo_type,
 };
@@ -429,27 +430,35 @@ fn transparent_callable_decorator_result<'db>(
         env: &ProgramEnvironment<'db>,
         ty: Type<'db>,
     ) -> Option<(BoundTypeVarInstance<'db>, TransparentCallableReturn<'db>)> {
-        let callable = ty.resolve_type_alias(db).as_callable()?;
-        if callable.kind(db) != CallableTypeKind::Regular {
-            return None;
-        }
-        let [signature] = callable.signatures(db).overloads.as_slice() else {
-            return None;
-        };
-        let paramspec = signature.parameters().as_paramspec()?;
-        let return_typevar = if let Some(typevar) = signature.return_ty.as_typevar() {
-            TransparentCallableReturn::TypeVar(typevar)
-        } else {
-            let specialization =
-                signature
-                    .return_ty
-                    .known_specialization(db, env, KnownClass::Awaitable)?;
-            let [inner] = specialization.types(db) else {
-                return None;
-            };
-            TransparentCallableReturn::Awaitable(inner.as_typevar()?)
-        };
-        Some((paramspec, return_typevar))
+        TypeInspector::inspect_root(
+            db,
+            env,
+            ty,
+            |_, _| None,
+            |_, ty| {
+                let callable = ty.as_callable()?;
+                if callable.kind(db) != CallableTypeKind::Regular {
+                    return None;
+                }
+                let [signature] = callable.signatures(db).overloads.as_slice() else {
+                    return None;
+                };
+                let paramspec = signature.parameters().as_paramspec()?;
+                let return_typevar = if let Some(typevar) = signature.return_ty.as_typevar() {
+                    TransparentCallableReturn::TypeVar(typevar)
+                } else {
+                    let specialization =
+                        signature
+                            .return_ty
+                            .known_specialization(db, env, KnownClass::Awaitable)?;
+                    let [inner] = specialization.types(db) else {
+                        return None;
+                    };
+                    TransparentCallableReturn::Awaitable(inner.as_typevar()?)
+                };
+                Some((paramspec, return_typevar))
+            },
+        )
     }
 
     if !matches!(decorated_ty, Type::FunctionLiteral(_) | Type::Callable(_)) {
@@ -3161,11 +3170,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     ) -> bool {
         let db = self.db();
         let env = self.program_environment().clone();
-        TypeTraversal::new(&env, AttributeDeletion { target, attribute }).visit_with(
-            db,
-            object_ty,
-            (self, emit_diagnostics),
-        )
+        TypeTraversal::with_root(&env, AttributeDeletion { target, attribute }, |root| {
+            root.visit_with(db, object_ty, (self, emit_diagnostics))
+        })
     }
 
     fn validate_attribute_deletion_leaf(
@@ -5552,62 +5559,75 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         decorator_node: &ast::Decorator,
         decorated_function: Option<&ast::StmtFunctionDef>,
     ) -> Type<'db> {
-        fn propagate_callable_kind<'d>(
-            db: &'d dyn Db,
-            env: &ProgramEnvironment<'d>,
-            ty: Type<'d>,
-            kind: CallableTypeKind,
-        ) -> Option<Type<'d>> {
-            match ty {
-                Type::Recursive(recursive) => {
-                    let unfolded = recursive
-                        .unfold(db, &ApplyTypeMappingVisitor::new(env))
-                        .into_unfolded()?;
-                    propagate_callable_kind(db, env, unfolded, kind)
+        struct PropagateCallableKind(CallableTypeKind);
+
+        impl<'db> TypeOperation<'db> for PropagateCallableKind {
+            type Output = Option<Type<'db>>;
+
+            fn on_cycle(
+                &self,
+                _traversal: &TypeTraversal<'_, 'db, Self>,
+                _ty: Type<'db>,
+                _kind: CycleKind,
+                _state: (),
+            ) -> Self::Output {
+                // Retain the original decorator result when its callable kind cannot be proved.
+                None
+            }
+
+            fn visit(
+                &self,
+                db: &'db dyn Db,
+                traversal: &TypeTraversal<'_, 'db, Self>,
+                ty: Type<'db>,
+                _state: (),
+            ) -> Self::Output {
+                match ty {
+                    Type::RecursiveVar(_) => {
+                        unreachable!("semantic operation on an unbound recursive variable")
+                    }
+                    Type::Callable(callable) => {
+                        Some(Type::Callable(callable.with_kind(db, self.0)))
+                    }
+                    Type::Union(union) => union.try_map(db, traversal.environment(), |element| {
+                        traversal.visit(db, *element)
+                    }),
+                    // Intersections are currently not handled here because that would require
+                    // the decorator to be explicitly annotated as returning an intersection.
+                    Type::Intersection(_) | Type::EnumComplement(_) => None,
+                    // All other types cannot have a callable kind propagated to them.
+                    Type::Dynamic(_)
+                    | Type::Recursive(_)
+                    | Type::TypeAlias(_)
+                    | Type::Divergent(_)
+                    | Type::Never
+                    | Type::FunctionLiteral(_)
+                    | Type::BoundMethod(_)
+                    | Type::KnownBoundMethod(_)
+                    | Type::WrapperDescriptor(_)
+                    | Type::DataclassDecorator(_)
+                    | Type::DataclassTransformer(_)
+                    | Type::ModuleLiteral(_)
+                    | Type::ClassLiteral(_)
+                    | Type::GenericAlias(_)
+                    | Type::SubclassOf(_)
+                    | Type::NominalInstance(_)
+                    | Type::ProtocolInstance(_)
+                    | Type::SpecialForm(_)
+                    | Type::KnownInstance(_)
+                    | Type::PropertyInstance(_)
+                    | Type::SlotDescriptor(_)
+                    | Type::AlwaysTruthy
+                    | Type::AlwaysFalsy
+                    | Type::LiteralValue(_)
+                    | Type::TypeVar(_)
+                    | Type::BoundSuper(_)
+                    | Type::TypeIs(_)
+                    | Type::TypeGuard(_)
+                    | Type::TypeForm(_)
+                    | Type::TypedDict(_)
+                    | Type::NewTypeInstance(_) => None,
                 }
-                Type::RecursiveVar(_) => {
-                    unreachable!("semantic operation on an unbound recursive variable")
-                }
-                Type::Callable(callable) => Some(Type::Callable(callable.with_kind(db, kind))),
-                Type::Union(union) => union.try_map(db, env, |element| {
-                    propagate_callable_kind(db, env, *element, kind)
-                }),
-                Type::TypeAlias(alias) => {
-                    propagate_callable_kind(db, env, alias.value_type(db), kind)
-                }
-                // Intersections are currently not handled here because that would require
-                // the decorator to be explicitly annotated as returning an intersection.
-                Type::Intersection(_) | Type::EnumComplement(_) => None,
-                // All other types cannot have a callable kind propagated to them.
-                Type::Dynamic(_)
-                | Type::Divergent(_)
-                | Type::Never
-                | Type::FunctionLiteral(_)
-                | Type::BoundMethod(_)
-                | Type::KnownBoundMethod(_)
-                | Type::WrapperDescriptor(_)
-                | Type::DataclassDecorator(_)
-                | Type::DataclassTransformer(_)
-                | Type::ModuleLiteral(_)
-                | Type::ClassLiteral(_)
-                | Type::GenericAlias(_)
-                | Type::SubclassOf(_)
-                | Type::NominalInstance(_)
-                | Type::ProtocolInstance(_)
-                | Type::SpecialForm(_)
-                | Type::KnownInstance(_)
-                | Type::PropertyInstance(_)
-                | Type::SlotDescriptor(_)
-                | Type::AlwaysTruthy
-                | Type::AlwaysFalsy
-                | Type::LiteralValue(_)
-                | Type::TypeVar(_)
-                | Type::BoundSuper(_)
-                | Type::TypeIs(_)
-                | Type::TypeGuard(_)
-                | Type::TypeForm(_)
-                | Type::TypedDict(_)
-                | Type::NewTypeInstance(_) => None,
             }
         }
         let db = self.db();
@@ -5669,7 +5689,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         // a `Callable`-typed decorator" in `callables_as_descriptors.md` for the
         // extended explanation.
         let inferred_ty = propagatable_kind
-            .and_then(|kind| propagate_callable_kind(db, env, return_ty, kind))
+            .and_then(|kind| {
+                TypeTraversal::with_root(env, PropagateCallableKind(kind), |root| {
+                    root.visit(db, return_ty)
+                })
+            })
             .unwrap_or(return_ty);
 
         if let Some(decorated_function) = decorated_function
@@ -5915,9 +5939,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             // but must preserve the precision provided by type context.
             let return_ty = speculative_bindings.return_type(db, env);
             if !(return_ty.is_assignable_to(db, env, narrowed_ty)
-                || (return_ty
-                    .resolve_type_alias(db)
-                    .is_literal_or_union_of_literals(db, env)
+                || (return_ty.is_literal_or_union_of_literals(db, env)
                     && call_expression_tcx
                         .annotation
                         .is_some_and(|declared_ty| return_ty.is_subtype_of(db, env, declared_ty))))
@@ -6786,10 +6808,18 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         // Avoid promoting explicitly annotated literal values.
         if let Type::LiteralValue(literal) = ty
             && let Some(tcx) = tcx.annotation
-            && let literal_tcx @ (Type::Union(_) | Type::LiteralValue(_)) = tcx
-                .resolve_type_alias(db)
-                .filter_union(db, env, |ty| ty.as_literal_value().is_some())
-            && ty.is_assignable_to(db, env, literal_tcx)
+            && TypeInspector::inspect_root(
+                db,
+                env,
+                tcx,
+                |_, _| false,
+                |_, tcx| {
+                    let literal_tcx =
+                        tcx.filter_union(db, env, |ty| ty.as_literal_value().is_some());
+                    matches!(literal_tcx, Type::Union(_) | Type::LiteralValue(_))
+                        && ty.is_assignable_to(db, env, literal_tcx)
+                },
+            )
         {
             ty = Type::LiteralValue(literal.to_unpromotable());
         }
@@ -6825,125 +6855,139 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         // `list` given the type context, and we wouldn't have to duplicate all
         // of the logic below.
 
-        let exactly_one_callable = |union: UnionType<'db>| {
-            union
-                .elements(db)
-                .iter()
-                .filter_map(|element| element.resolve_type_alias(db).as_callable())
-                .exactly_one()
-                .ok()
-        };
-        let target_callable = (match target.resolve_type_alias(db) {
-            Type::Callable(callable) => Some(callable),
-            Type::Union(union) => exactly_one_callable(union),
-            _ => None,
-        })?;
+        TypeInspector::inspect_root(
+            db,
+            env,
+            target,
+            |_, _| None,
+            |inspector, target| {
+                let exactly_one_callable = |union: UnionType<'db>| {
+                    union
+                        .elements(db)
+                        .iter()
+                        .filter_map(|element| {
+                            inspector.inspect(db, *element, |_, _| None, |_, ty| ty.as_callable())
+                        })
+                        .exactly_one()
+                        .ok()
+                };
+                let target_callable = (match target {
+                    Type::Callable(callable) => Some(callable),
+                    Type::Union(union) => exactly_one_callable(union),
+                    _ => None,
+                })?;
 
-        // Callables made entirely of dynamic types provide no constraints for specializing the
-        // class. The same is true for a parameterless context whose return type is an
-        // unspecialized variable from an enclosing generic call.
-        if target_callable.signatures(db).iter().all(|signature| {
-            let parameters = signature.parameters().as_slice();
-            (signature.return_ty.is_dynamic()
-                && parameters
-                    .iter()
-                    .all(|parameter| parameter.annotated_type().is_dynamic()))
-                || (parameters.is_empty()
-                    && matches!(
-                        signature.return_ty,
-                        Type::Dynamic(DynamicType::UnspecializedTypeVar)
-                    ))
-        }) {
-            return Some(ty);
-        }
-        let Some(class_generic_context) = class.generic_context(db) else {
-            return Some(ty);
-        };
-        let Some(source_callable) = ty.try_upcast_to_callable(db, env) else {
-            return Some(ty);
-        };
-        // The callable relation existentially solves variables bound by each signature. Keep
-        // method-local constructor variables scoped there, but expose class variables to this
-        // outer contextual-specialization solve.
-        let source_callable = source_callable.map(|callable| {
-            let signatures = CallableSignature::from_overloads(
-                callable.signatures(db).overloads.iter().map(|signature| {
-                    let signature_generic_context = signature.generic_context.and_then(|context| {
-                        let mut variables = context
-                            .variables(db)
-                            .filter(|typevar| {
-                                !class_generic_context.contains(db, typevar.identity(db))
-                            })
-                            .peekable();
-                        variables
-                            .peek()
-                            .is_some()
-                            .then(|| GenericContext::from_typevar_instances(db, env, variables))
-                    });
-                    Signature::new_generic(
-                        signature_generic_context,
-                        signature.parameters().clone(),
-                        signature.return_ty,
-                    )
-                    .with_definition(signature.definition())
-                }),
-            );
-            callable.with_signatures(db, signatures)
-        });
-        let inferable = class_generic_context.inferable_typevars(db);
-        let constraints = ConstraintSetBuilder::new();
-        let path_bounds = source_callable
-            .to_type(db, env)
-            .assignable_solutions_with_inferable(
-                db,
-                env,
-                Type::Callable(target_callable),
-                inferable,
-            );
-        let Solutions::Constrained(solutions) = path_bounds.solve(db, env, &constraints) else {
-            return Some(ty);
-        };
+                // Callables made entirely of dynamic types provide no constraints for specializing the
+                // class. The same is true for a parameterless context whose return type is an
+                // unspecialized variable from an enclosing generic call.
+                if target_callable.signatures(db).iter().all(|signature| {
+                    let parameters = signature.parameters().as_slice();
+                    (signature.return_ty.is_dynamic()
+                        && parameters
+                            .iter()
+                            .all(|parameter| parameter.annotated_type().is_dynamic()))
+                        || (parameters.is_empty()
+                            && matches!(
+                                signature.return_ty,
+                                Type::Dynamic(DynamicType::UnspecializedTypeVar)
+                            ))
+                }) {
+                    return Some(ty);
+                }
+                let Some(class_generic_context) = class.generic_context(db) else {
+                    return Some(ty);
+                };
+                let Some(source_callable) = ty.try_upcast_to_callable(db, env) else {
+                    return Some(ty);
+                };
+                // The callable relation existentially solves variables bound by each signature. Keep
+                // method-local constructor variables scoped there, but expose class variables to this
+                // outer contextual-specialization solve.
+                let source_callable = source_callable.map(|callable| {
+                    let signatures = CallableSignature::from_overloads(
+                        callable.signatures(db).overloads.iter().map(|signature| {
+                            let signature_generic_context =
+                                signature.generic_context.and_then(|context| {
+                                    let mut variables = context
+                                        .variables(db)
+                                        .filter(|typevar| {
+                                            !class_generic_context
+                                                .contains(db, typevar.identity(db))
+                                        })
+                                        .peekable();
+                                    variables.peek().is_some().then(|| {
+                                        GenericContext::from_typevar_instances(db, env, variables)
+                                    })
+                                });
+                            Signature::new_generic(
+                                signature_generic_context,
+                                signature.parameters().clone(),
+                                signature.return_ty,
+                            )
+                            .with_definition(signature.definition())
+                        }),
+                    );
+                    callable.with_signatures(db, signatures)
+                });
+                let inferable = class_generic_context.inferable_typevars(db);
+                let constraints = ConstraintSetBuilder::new();
+                let path_bounds = source_callable
+                    .to_type(db, env)
+                    .assignable_solutions_with_inferable(
+                        db,
+                        env,
+                        Type::Callable(target_callable),
+                        inferable,
+                    );
+                let Solutions::Constrained(solutions) = path_bounds.solve(db, env, &constraints)
+                else {
+                    return Some(ty);
+                };
 
-        let mut type_context_mappings: FxHashMap<BoundTypeVarIdentity<'db>, UnionAccumulator<'db>> =
-            FxHashMap::default();
-        for solution in solutions.into_vec() {
-            for binding in solution.solved_typevars {
-                let inferred_ty = binding
-                    .solution
-                    .filter_union(db, env, |ty| !ty.has_provisional_marker(db, env));
-                if inferred_ty.has_provisional_marker(db, env) {
-                    continue;
+                let mut type_context_mappings: FxHashMap<
+                    BoundTypeVarIdentity<'db>,
+                    UnionAccumulator<'db>,
+                > = FxHashMap::default();
+                for solution in solutions.into_vec() {
+                    for binding in solution.solved_typevars {
+                        let inferred_ty = binding
+                            .solution
+                            .filter_union(db, env, |ty| !ty.has_provisional_marker(db, env));
+                        if inferred_ty.has_provisional_marker(db, env) {
+                            continue;
+                        }
+
+                        type_context_mappings
+                            .entry(binding.bound_typevar.identity(db))
+                            .and_modify(|existing| existing.add(db, env, inferred_ty))
+                            .or_insert_with(|| UnionAccumulator::new(inferred_ty));
+                    }
                 }
 
-                type_context_mappings
-                    .entry(binding.bound_typevar.identity(db))
-                    .and_modify(|existing| existing.add(db, env, inferred_ty))
-                    .or_insert_with(|| UnionAccumulator::new(inferred_ty));
-            }
-        }
+                if type_context_mappings.is_empty() {
+                    return Some(ty);
+                }
 
-        if type_context_mappings.is_empty() {
-            return Some(ty);
-        }
-
-        let type_context_mappings: FxHashMap<BoundTypeVarIdentity<'db>, Type<'db>> =
-            type_context_mappings
-                .into_iter()
-                .map(|(identity, accumulator)| (identity, accumulator.into_type(db, env)))
-                .collect();
-        let specialized = Type::from(class.apply_specialization(db, |generic_context| {
-            generic_context.specialize_recursive(
-                db,
-                generic_context
-                    .variables(db)
-                    .map(|typevar| type_context_mappings.get(&typevar.identity(db)).copied()),
-            )
-        }));
-        if specialized.is_assignable_to(db, env, Type::Callable(target_callable)) {
-            Some(specialized)
-        } else {
-            Some(ty)
-        }
+                let type_context_mappings: FxHashMap<BoundTypeVarIdentity<'db>, Type<'db>> =
+                    type_context_mappings
+                        .into_iter()
+                        .map(|(identity, accumulator)| (identity, accumulator.into_type(db, env)))
+                        .collect();
+                let specialized = Type::from(class.apply_specialization(db, |generic_context| {
+                    generic_context.specialize_recursive(
+                        db,
+                        generic_context.variables(db).map(|typevar| {
+                            type_context_mappings.get(&typevar.identity(db)).copied()
+                        }),
+                    )
+                }));
+                if specialized.is_assignable_to(db, env, Type::Callable(target_callable)) {
+                    Some(specialized)
+                } else {
+                    Some(ty)
+                }
+            },
+        )
     }
 
     /// Specialize a bare generic class value based on type context.
@@ -6964,39 +7008,54 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             return specialized;
         }
 
-        let matching_class_type = |target: Type<'db>| {
-            let generic_alias = match target.resolve_type_alias(db) {
-                Type::SubclassOf(subclass)
-                    if let SubclassOfInner::Class(ClassType::Generic(alias)) =
-                        subclass.subclass_of() =>
-                {
-                    alias
-                }
-                Type::GenericAlias(alias) => alias,
-                _ => return None,
-            };
+        TypeInspector::inspect_root(
+            db,
+            env,
+            target,
+            |_, _| ty,
+            |inspector, target| {
+                let matching_class_type = |target: Type<'db>| {
+                    inspector.inspect(
+                        db,
+                        target,
+                        |_, _| None,
+                        |_, target| {
+                            let generic_alias = match target {
+                                Type::SubclassOf(subclass)
+                                    if let SubclassOfInner::Class(ClassType::Generic(alias)) =
+                                        subclass.subclass_of() =>
+                                {
+                                    alias
+                                }
+                                Type::GenericAlias(alias) => alias,
+                                _ => return None,
+                            };
 
-            if class.as_static()? == generic_alias.origin(db) {
-                Some(generic_alias)
-            } else {
-                None
-            }
-        };
+                            if class.as_static()? == generic_alias.origin(db) {
+                                Some(generic_alias)
+                            } else {
+                                None
+                            }
+                        },
+                    )
+                };
 
-        let class_type = match target.resolve_type_alias(db) {
-            Type::Union(union) => union
-                .elements(db)
-                .iter()
-                .filter_map(|element| matching_class_type(*element))
-                .exactly_one()
-                .ok(),
-            target => matching_class_type(target),
-        };
+                let class_type = match target {
+                    Type::Union(union) => union
+                        .elements(db)
+                        .iter()
+                        .filter_map(|element| matching_class_type(*element))
+                        .exactly_one()
+                        .ok(),
+                    target => matching_class_type(target),
+                };
 
-        class_type
-            .map(Type::GenericAlias)
-            .filter(|class_type| !class_type.has_provisional_marker(db, env))
-            .unwrap_or(ty)
+                class_type
+                    .map(Type::GenericAlias)
+                    .filter(|class_type| !class_type.has_provisional_marker(db, env))
+                    .unwrap_or(ty)
+            },
+        )
     }
 
     #[track_caller]
@@ -7498,6 +7557,37 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     }
 
     fn infer_dict_expression(&mut self, dict: &ast::ExprDict, tcx: TypeContext<'db>) -> Type<'db> {
+        TypeInspector::scope(self.program_environment(), |inspector| {
+            self.infer_dict_expression_in(inspector, dict, tcx)
+        })
+    }
+
+    fn infer_dict_expression_in(
+        &mut self,
+        inspector: &TypeInspector<'_, 'db>,
+        dict: &ast::ExprDict,
+        tcx: TypeContext<'db>,
+    ) -> Type<'db> {
+        inspector.inspect(
+            self.db(),
+            tcx.annotation.unwrap_or(Type::unknown()),
+            |_, _| Type::unknown(),
+            |inspector, annotation| {
+                self.infer_dict_expression_inner(
+                    inspector,
+                    dict,
+                    tcx.with_annotation(tcx.annotation.map(|_| annotation)),
+                )
+            },
+        )
+    }
+
+    fn infer_dict_expression_inner(
+        &mut self,
+        inspector: &TypeInspector<'_, 'db>,
+        dict: &ast::ExprDict,
+        tcx: TypeContext<'db>,
+    ) -> Type<'db> {
         let db = self.db();
         let env = self.program_environment();
         let ast::ExprDict {
@@ -7526,18 +7616,27 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 let mut has_dict_compatible_fallback = false;
 
                 for element in union_elements {
-                    let element = element.resolve_type_alias(db);
-
-                    if let Some(typed_dict) = element.as_typed_dict() {
-                        typed_dicts.push(typed_dict);
-                    } else if !has_dict_compatible_fallback {
-                        // Suppress `TypedDict` diagnostics only if this literal is assignable to
-                        // the non-`TypedDict` arm of the union.
-                        let mut speculative_builder = self.speculate_without_diagnostics();
-                        has_dict_compatible_fallback = speculative_builder
-                            .infer_dict_expression(dict, tcx.with_annotation(Some(element)))
-                            .is_assignable_to(db, env, element);
-                    }
+                    inspector.inspect(
+                        db,
+                        *element,
+                        |_, _| (),
+                        |inspector, element| {
+                            if let Some(typed_dict) = element.as_typed_dict() {
+                                typed_dicts.push(typed_dict);
+                            } else if !has_dict_compatible_fallback {
+                                // Suppress `TypedDict` diagnostics only if this literal is assignable to
+                                // the non-`TypedDict` arm of the union.
+                                let mut speculative_builder = self.speculate_without_diagnostics();
+                                has_dict_compatible_fallback = speculative_builder
+                                    .infer_dict_expression_in(
+                                        inspector,
+                                        dict,
+                                        tcx.with_annotation(Some(element)),
+                                    )
+                                    .is_assignable_to(db, env, element);
+                            }
+                        },
+                    );
                 }
 
                 if let [typed_dict] = typed_dicts.as_slice()
@@ -7746,8 +7845,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             let mut elt_tcx_variance: FxHashMap<BoundTypeVarIdentity<'_>, TypeVarVariance> =
                 FxHashMap::default();
 
-            if let Some(tcx) = tcx.annotation.map(|tcx| tcx.resolve_type_alias(db))
-                && matches!(tcx, Type::NominalInstance(_))
+            if let Some(tcx) = tcx.annotation
+                && tcx.has_outer_type(db, |ty| matches!(ty, Type::NominalInstance(_)))
                 && let Some(specialization) = tcx.known_specialization(db, env, collection_class)
                 && specialization.generic_context(self.db()) == generic_context
                 && generic_context.variables(self.db()).all(|typevar| {
@@ -8819,20 +8918,22 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         // TODO: We could perform multi-inference here if there are multiple `Callable` annotations
         // in the union/intersection.
-        let callable_tcx = if let Some(tcx) = tcx.annotation
-            && let Some(callable) = tcx
-                .filter_union(db, env, Type::is_callable_type)
-                .resolve_type_alias(db)
-                .as_callable()
-        {
-            match callable.signatures(self.db()).overloads.as_slice() {
-                [signature] => Some(signature),
-                // TODO: We could similarly perform multi-inference here if there are multiple overloads.
-                _ => None,
-            }
-        } else {
-            None
-        };
+        let callable_tcx = tcx.annotation.and_then(|tcx| {
+            TypeInspector::inspect_root(
+                db,
+                env,
+                tcx.filter_union(db, env, Type::is_callable_type),
+                |_, _| None,
+                |_, ty| {
+                    let callable = ty.as_callable()?;
+                    match callable.signatures(db).overloads.as_slice() {
+                        [signature] => Some(signature),
+                        // TODO: Infer against each overload when there is more than one.
+                        _ => None,
+                    }
+                },
+            )
+        });
 
         // Extract the annotated parameter types.
         //
@@ -8908,7 +9009,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 .chain(keyword_only)
                 .chain(keyword_variadic);
 
-            Parameters::from_annotation(db, parameters)
+            Parameters::from_annotation(db, env, parameters)
         } else {
             Parameters::empty()
         };
@@ -9941,7 +10042,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         if let Some(instance_ty) =
             self.infer_builtin_range_instance_type(callable_type, arguments, &call_arguments)
         {
-            bindings = bindings.with_constructed_instance_type(db, instance_ty);
+            bindings = bindings.with_constructed_instance_type(db, env, instance_ty);
         }
 
         let db = self.db();
@@ -10992,7 +11093,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     ) -> Result<TypeAndQualifiers<'db>, TypeAndQualifiers<'db>> {
         struct MissingAttribute<'a>(&'a str);
 
-        impl<'db> TypeOperation<'db> for MissingAttribute<'_> {
+        impl<'db> TypeOperation<'db, bool> for MissingAttribute<'_> {
             type Output = Vec<Type<'db>>;
 
             fn on_cycle(
@@ -11000,7 +11101,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 _traversal: &TypeTraversal<'_, 'db, Self>,
                 _ty: Type<'db>,
                 _kind: CycleKind,
-                _state: (),
+                _state: bool,
             ) -> Self::Output {
                 Vec::new()
             }
@@ -11010,18 +11111,26 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 db: &'db dyn Db,
                 traversal: &TypeTraversal<'_, 'db, Self>,
                 ty: Type<'db>,
-                _state: (),
+                in_union: bool,
             ) -> Self::Output {
-                if let Some(union) = ty.as_union_like(db) {
+                if let Type::NewTypeInstance(newtype) = ty
+                    && newtype
+                        .concrete_base_type(db)
+                        .has_outer_type(db, super::super::Type::is_union)
+                {
+                    return traversal.visit_with(db, newtype.concrete_base_type(db), in_union);
+                }
+                if let Type::Union(union) = ty {
                     union
                         .elements(db)
                         .iter()
-                        .flat_map(|element| traversal.visit(db, *element))
+                        .flat_map(|element| traversal.visit_with(db, *element, true))
                         .collect()
-                } else if ty
-                    .member(db, traversal.environment(), self.0)
-                    .place
-                    .is_undefined()
+                } else if in_union
+                    && ty
+                        .member(db, traversal.environment(), self.0)
+                        .place
+                        .is_undefined()
                 {
                     vec![ty]
                 } else {
@@ -11286,8 +11395,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     //
                     // On the other hand, we could be looking at a union where some elements have
                     // the attribute but others definitely don't. That's a very different case, and
-                    // we want it to be an error. Use `as_union_like` here to handle type aliases
-                    // of unions and `NewType`s of float/complex in addition to explicit unions.
+                    // we want it to be an error. Traverse aliases and numeric `NewType` bases
+                    // along with explicit unions when collecting missing alternatives.
                     //
                     // Attribute lookup on a bounded type variable delegates to its upper bound, so
                     // use that bound here too when determining whether the lookup was on a union.
@@ -11299,39 +11408,36 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         value_type
                     };
 
-                    if let Some(union) = union_like_type.as_union_like(db) {
-                        let mut elements_missing_the_attribute = FxIndexSet::default();
-                        let traversal = TypeTraversal::new(env, MissingAttribute(attr_name));
-                        for element in union.elements(db) {
-                            elements_missing_the_attribute.extend(traversal.visit(db, *element));
-                        }
+                    let elements_missing_the_attribute: FxIndexSet<_> =
+                        TypeTraversal::with_root(env, MissingAttribute(attr_name), |traversal| {
+                            traversal.visit_with(db, union_like_type, false)
+                        })
+                        .into_iter()
+                        .collect();
+                    if !elements_missing_the_attribute.is_empty() {
+                        if let Some(builder) =
+                            self.context.report_lint(&UNRESOLVED_ATTRIBUTE, attribute)
+                        {
+                            let types = std::iter::once(union_like_type)
+                                .chain(elements_missing_the_attribute.iter().copied());
+                            let settings =
+                                DisplaySettings::from_possibly_ambiguous_types(db, env, types);
+                            let missing_types = elements_missing_the_attribute
+                                .iter()
+                                .map(|ty| {
+                                    format!("`{}`", ty.display_with(db, env, settings.clone()))
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", ");
 
-                        if !elements_missing_the_attribute.is_empty() {
-                            if let Some(builder) =
-                                self.context.report_lint(&UNRESOLVED_ATTRIBUTE, attribute)
-                            {
-                                let types = std::iter::once(union_like_type)
-                                    .chain(elements_missing_the_attribute.iter().copied());
-                                let settings =
-                                    DisplaySettings::from_possibly_ambiguous_types(db, env, types);
-                                let missing_types = elements_missing_the_attribute
-                                    .iter()
-                                    .map(|ty| {
-                                        format!("`{}`", ty.display_with(db, env, settings.clone()))
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join(", ");
-
-                                builder.into_diagnostic(format_args!(
-                                    "Attribute `{attr_name}` is not defined on {} \
+                            builder.into_diagnostic(format_args!(
+                                "Attribute `{attr_name}` is not defined on {} \
                                     in union `{union_like_type}`",
-                                    missing_types,
-                                    union_like_type =
-                                        union_like_type.display_with(db, env, settings),
-                                ));
-                            }
-                            return type_when_bound;
+                                missing_types,
+                                union_like_type = union_like_type.display_with(db, env, settings),
+                            ));
                         }
+                        return type_when_bound;
                     }
 
                     report_possibly_missing_attribute(

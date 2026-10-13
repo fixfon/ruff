@@ -243,9 +243,10 @@ impl<'db> Type<'db> {
         env: &ProgramEnvironment<'db>,
         mode: EvaluationMode,
     ) -> Result<Cow<'db, TupleSpec<'db>>, IterationError<'db>> {
-        TypeTraversal::new(env, TryIterate(mode))
-            .visit_with(db, self, true)
-            .map(|spec| spec.unwrap_or_else(|| Cow::Owned(TupleSpec::homogeneous(Type::unknown()))))
+        TypeTraversal::with_root(env, TryIterate(mode), |root| {
+            root.visit_with(db, self, true)
+        })
+        .map(|spec| spec.unwrap_or_else(|| Cow::Owned(TupleSpec::homogeneous(Type::unknown()))))
     }
 
     fn try_iterate_impl(

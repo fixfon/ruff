@@ -8,6 +8,7 @@
 //! relation and constraint set.
 
 use crate::Db;
+use crate::types::recursive::TypeInspector;
 use crate::types::{CycleKind, TypeOperation, TypeTraversal};
 use ty_module_resolver::KnownModule;
 use ty_python_core::{definition::Definition, use_def_map};
@@ -292,9 +293,10 @@ pub(super) fn attribute_write_requirement<'db>(
     object_ty: Type<'db>,
     attribute: &str,
 ) -> AttributeWriteRequirement<'db> {
-    TypeTraversal::new(env, ResolveAttributeWrite(attribute))
-        .visit(db, object_ty)
-        .unwrap_or(AttributeWriteRequirement::Unconstrained)
+    TypeTraversal::with_root(env, ResolveAttributeWrite(attribute), |root| {
+        root.visit(db, object_ty)
+    })
+    .unwrap_or(AttributeWriteRequirement::Unconstrained)
 }
 
 struct ResolveAttributeWrite<'a>(&'a str);
@@ -664,14 +666,22 @@ fn possible_class_attribute_descriptor<'db>(
         place_from_bindings(db, env, use_def.end_of_scope_bindings(definition.place(db)))
             .place
             .ignore_possibly_undefined()?;
-    let descriptor_ty = match descriptor_ty.resolve_type_alias(db) {
-        Type::TypeForm(typeform) => typeform.type_argument(db).to_meta_type(db, env),
-        descriptor_ty => descriptor_ty,
-    };
+    TypeInspector::inspect_root(
+        db,
+        env,
+        descriptor_ty,
+        |_, _| None,
+        |_, descriptor_ty| {
+            let descriptor_ty = match descriptor_ty {
+                Type::TypeForm(typeform) => typeform.type_argument(db).to_meta_type(db, env),
+                descriptor_ty => descriptor_ty,
+            };
 
-    descriptor_ty
-        .is_data_descriptor(db, env)
-        .then_some(descriptor_ty)
+            descriptor_ty
+                .is_data_descriptor(db, env)
+                .then_some(descriptor_ty)
+        },
+    )
 }
 
 /// Convert an explicitly resolved member into either a descriptor call or a direct type check.
@@ -1046,24 +1056,31 @@ pub(super) fn descriptor_setter_domain<'db>(
     descriptor_ty: Type<'db>,
     receiver_ty: Type<'db>,
 ) -> DescriptorSetterDomain<'db> {
-    let descriptor_ty = descriptor_ty.resolve_type_alias(db);
-    match descriptor_ty {
-        Type::Union(union) => {
-            let mut write_types = Vec::with_capacity(union.elements(db).len());
-            for descriptor_ty in union.elements(db) {
-                match single_descriptor_setter_domain(db, env, *descriptor_ty, receiver_ty) {
-                    DescriptorSetterDomain::Missing => return DescriptorSetterDomain::Missing,
-                    DescriptorSetterDomain::Known(write_ty) => write_types.push(write_ty),
-                    DescriptorSetterDomain::Deferred => return DescriptorSetterDomain::Deferred,
+    TypeInspector::inspect_root(
+        db,
+        env,
+        descriptor_ty,
+        |_, _| DescriptorSetterDomain::Deferred,
+        |_, descriptor_ty| match descriptor_ty {
+            Type::Union(union) => {
+                let mut write_types = Vec::with_capacity(union.elements(db).len());
+                for descriptor_ty in union.elements(db) {
+                    match single_descriptor_setter_domain(db, env, *descriptor_ty, receiver_ty) {
+                        DescriptorSetterDomain::Missing => return DescriptorSetterDomain::Missing,
+                        DescriptorSetterDomain::Known(write_ty) => write_types.push(write_ty),
+                        DescriptorSetterDomain::Deferred => {
+                            return DescriptorSetterDomain::Deferred;
+                        }
+                    }
                 }
+                IntersectionType::bounded_from_elements(db, env, write_types).map_or(
+                    DescriptorSetterDomain::Deferred,
+                    DescriptorSetterDomain::Known,
+                )
             }
-            IntersectionType::bounded_from_elements(db, env, write_types).map_or(
-                DescriptorSetterDomain::Deferred,
-                DescriptorSetterDomain::Known,
-            )
-        }
-        _ => single_descriptor_setter_domain(db, env, descriptor_ty, receiver_ty),
-    }
+            _ => single_descriptor_setter_domain(db, env, descriptor_ty, receiver_ty),
+        },
+    )
 }
 
 /// Derive the values accepted by one possible runtime descriptor.
@@ -1479,14 +1496,14 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                 {
                     return self.check_type_pair(db, value_ty, set_type);
                 }
-                TypeTraversal::from_mapping_visitor(
+                TypeTraversal::with_mapping_visitor(
                     self.materialization_visitor,
                     CheckDescriptorWrite {
                         receiver_ty: object_ty,
                         value_ty,
                     },
+                    |root| root.visit_with(db, *descriptor_ty, self),
                 )
-                .visit_with(db, *descriptor_ty, self)
             }
             ExplicitAttributeWriteRequirement::AssignableTo { ty, .. } => {
                 self.check_type_pair(db, value_ty, *ty)

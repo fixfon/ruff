@@ -581,10 +581,31 @@ impl<'db> SubscriptChecker<'_, 'db> {
             return value_ty.subscript_impl(db, self, slice_ty);
         }
         self.active
-            .visit_active(db, (value_ty, slice_ty), |cycle| match cycle {
-                Some(CycleKind::Exact) => Ok(Type::Never),
-                Some(CycleKind::MatchingIdentity) => Ok(Type::unknown()),
-                None => value_ty.subscript_impl(db, self, slice_ty),
+            .visit_active_with_expansion(db, (value_ty, slice_ty), &self.mapping, |visit| {
+                match visit {
+                    Err(CycleKind::Exact) => Ok(Type::Never),
+                    Err(CycleKind::MatchingIdentity) => Ok(Type::unknown()),
+                    Ok(expansion) => match (value_ty, slice_ty) {
+                        (Type::Dynamic(_) | Type::Divergent(_) | Type::Never, _) => {
+                            value_ty.subscript_impl(db, self, slice_ty)
+                        }
+                        (Type::Recursive(recursive), _) => expansion
+                            .unfold(db, recursive)
+                            .map(|body| self.check(db, body, slice_ty))
+                            .unwrap_or(Ok(value_ty)),
+                        (_, Type::Recursive(recursive)) => expansion
+                            .unfold(db, recursive)
+                            .map(|body| self.check(db, value_ty, body))
+                            .unwrap_or(Ok(value_ty)),
+                        (Type::TypeAlias(alias), _) => {
+                            self.check(db, alias.value_type(db), slice_ty)
+                        }
+                        (_, Type::TypeAlias(alias)) => {
+                            self.check(db, value_ty, alias.value_type(db))
+                        }
+                        _ => value_ty.subscript_impl(db, self, slice_ty),
+                    },
+                }
             })
     }
 }
@@ -627,25 +648,14 @@ impl<'db> Type<'db> {
             (Type::RecursiveVar(_), _) | (_, Type::RecursiveVar(_)) => {
                 unreachable!("semantic operation on an unbound recursive variable")
             }
-            (Type::Dynamic(_) | Type::Divergent(_) | Type::Never, _) => Some(Ok(value_ty)),
-
-            (Type::Recursive(recursive), _) => Some(
-                recursive
-                    .unfold(db, &checker.mapping)
-                    .map(|unfolded| checker.check(db, unfolded, slice_ty))
-                    .unwrap_or(Ok(value_ty)),
-            ),
-
-            (_, Type::Recursive(recursive)) => Some(
-                recursive
-                    .unfold(db, &checker.mapping)
-                    .map(|unfolded| checker.check(db, value_ty, unfolded))
-                    .unwrap_or(Ok(value_ty)),
-            ),
-
-            (Type::TypeAlias(alias), _) => Some(checker.check(db, alias.value_type(db), slice_ty)),
-
-            (_, Type::TypeAlias(alias)) => Some(checker.check(db, value_ty, alias.value_type(db))),
+            (
+                Type::Dynamic(_)
+                | Type::Divergent(_)
+                | Type::Never
+                | Type::Recursive(_)
+                | Type::TypeAlias(_),
+                _,
+            ) => Some(Ok(value_ty)),
 
             // Expand overlapping alternatives before collecting their subscript errors.
             (Type::Union(union), _) if union.needs_alias_expansion(db, &checker.mapping) => {

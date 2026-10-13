@@ -1,3 +1,4 @@
+use crate::types::recursive::TypeInspector;
 use crate::types::{CycleKind, TypeOperation, TypeTraversal};
 use crate::{
     Db, DisplaySettings, FxIndexMap, ProgramEnvironment,
@@ -163,9 +164,10 @@ impl<'db> ExpectedReturnType<'db> {
             env: &ProgramEnvironment<'db>,
             ty: Type<'db>,
         ) -> Type<'db> {
-            match ty.resolve_type_alias(db) {
-                Type::TypeIs(_) | Type::TypeGuard(_) => KnownClass::Bool.to_instance(db, env),
-                _ => ty,
+            if ty.has_outer_type(db, |ty| matches!(ty, Type::TypeIs(_) | Type::TypeGuard(_))) {
+                KnownClass::Bool.to_instance(db, env)
+            } else {
+                ty
             }
         }
 
@@ -637,30 +639,46 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 _ => None,
             };
             if let Some(kind) = descriptor_kind {
-                let wrap = |ty: Type<'db>| match ty.resolve_type_alias(db) {
-                    Type::FunctionLiteral(function)
-                        if function.callable_type_kind(db) == CallableTypeKind::FunctionLike
-                            || function.callable_type_kind(db) == kind =>
-                    {
-                        Some(Type::FunctionLiteral(
-                            function.with_descriptor_kind(db, kind),
-                        ))
-                    }
-                    Type::Callable(callable)
-                        if matches!(
-                            callable.kind(db),
-                            CallableTypeKind::Regular | CallableTypeKind::FunctionLike
-                        ) || callable.kind(db) == kind =>
-                    {
-                        Some(Type::Callable(callable.with_kind(db, kind)))
-                    }
-                    _ => None,
-                };
-                let wrapped = if let Some(union) = inferred_ty.as_union_like(db) {
-                    union.try_map(db, self.program_environment(), |ty| wrap(*ty))
-                } else {
-                    wrap(inferred_ty)
-                };
+                fn wrap<'db>(
+                    db: &'db dyn Db,
+                    inspector: &TypeInspector<'_, 'db>,
+                    ty: Type<'db>,
+                    kind: CallableTypeKind,
+                ) -> Option<Type<'db>> {
+                    inspector.inspect(
+                        db,
+                        ty,
+                        |_, _| None,
+                        |inspector, ty| match ty {
+                            Type::Union(union) => {
+                                union.try_map(db, inspector.environment(), |ty| {
+                                    wrap(db, inspector, *ty, kind)
+                                })
+                            }
+                            Type::FunctionLiteral(function)
+                                if function.callable_type_kind(db)
+                                    == CallableTypeKind::FunctionLike
+                                    || function.callable_type_kind(db) == kind =>
+                            {
+                                Some(Type::FunctionLiteral(
+                                    function.with_descriptor_kind(db, kind),
+                                ))
+                            }
+                            Type::Callable(callable)
+                                if matches!(
+                                    callable.kind(db),
+                                    CallableTypeKind::Regular | CallableTypeKind::FunctionLike
+                                ) || callable.kind(db) == kind =>
+                            {
+                                Some(Type::Callable(callable.with_kind(db, kind)))
+                            }
+                            _ => None,
+                        },
+                    )
+                }
+                let wrapped = TypeInspector::scope(self.program_environment(), |inspector| {
+                    wrap(db, inspector, inferred_ty, kind)
+                });
                 if let Some(wrapped) = wrapped {
                     inferred_ty = wrapped;
                     continue;
@@ -1012,6 +1030,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let annotated_type = self.file_expression_type(annotation);
         let Some(unpacked_keys) = extract_unpacked_typed_dict_keys_from_kwargs_annotation(
             db,
+            env,
             annotated_type,
             annotation_flags,
         ) else {
@@ -1412,6 +1431,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 }
             } else if extract_unpacked_typed_dict_keys_from_kwargs_annotation(
                 db,
+                env,
                 annotated_type,
                 self.file_type_expression_flags(annotation),
             )
@@ -2283,7 +2303,7 @@ fn is_instance_tuple_exhaustive<'db>(
         return false;
     }
 
-    TypeTraversal::new(env, InstanceTupleCovers(&tuple)).visit(db, ty)
+    TypeTraversal::with_root(env, InstanceTupleCovers(&tuple), |root| root.visit(db, ty))
 }
 
 struct InstanceTupleCovers<'a, 'db>(&'a TupleSpec<'db>);
@@ -2345,7 +2365,7 @@ fn is_instance_truthiness<'db>(
     ty: Type<'db>,
     class: ClassLiteral<'db>,
 ) -> Truthiness {
-    TypeTraversal::new(env, InstanceTruthiness(class)).visit(db, ty)
+    TypeTraversal::with_root(env, InstanceTruthiness(class), |root| root.visit(db, ty))
 }
 
 struct InstanceTruthiness<'db>(ClassLiteral<'db>);

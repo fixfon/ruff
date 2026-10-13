@@ -36,8 +36,8 @@ use crate::types::function::FunctionLiteral;
 use crate::types::generics::{GenericContext, Specialization};
 use crate::types::visitor::{TypeCollector, TypeVisitor, walk_type_with_recursion_guard};
 use crate::types::{
-    ApplyTypeMappingVisitor, BoundTypeVarIdentity, BoundTypeVarInstance, MaterializationKind,
-    ProtocolInstanceType, RecursiveType, StaticClassLiteral, Type, TypeAliasType, TypedDictType,
+    BoundTypeVarIdentity, BoundTypeVarInstance, MaterializationKind, ProtocolInstanceType,
+    RecursiveType, StaticClassLiteral, Type, TypeAliasType, TypedDictType,
 };
 use crate::{Db, ProgramEnvironment};
 
@@ -602,13 +602,15 @@ impl<'db> SpecializationFlowVisitor<'db> {
     fn visit_definition_body(&self, db: &'db dyn Db, source: RecursiveDefinition<'db>) -> bool {
         match source {
             RecursiveDefinition::Structural(recursive) => {
-                let Some(body) = recursive
-                    .unfold(db, &ApplyTypeMappingVisitor::new(&self.env))
-                    .into_unfolded()
-                else {
-                    return false;
-                };
-                self.visit_type(db, body);
+                let visitor: super::recursive::TypeVisitorState<'_, 'db, (), Type<'db>, bool, 1> =
+                    super::recursive::TypeVisitorState::new(&self.env, false);
+                return visitor.visit_with_expansion(db, Type::Recursive(recursive), |expansion| {
+                    let Some(body) = expansion.unfold(db, recursive).into_unfolded() else {
+                        return false;
+                    };
+                    self.visit_type(db, body);
+                    !self.has_unresolved_type.get()
+                });
             }
             RecursiveDefinition::TypeAlias(alias) => {
                 self.visit_type(db, alias.raw_value_type(db));
@@ -681,6 +683,10 @@ impl<'db> TypeVisitor<'db> for SpecializationFlowVisitor<'db> {
 
     fn should_visit_lazy_type_attributes(&self) -> bool {
         false
+    }
+
+    fn visit_recursive_type(&self, _db: &'db dyn Db, _recursive: crate::types::RecursiveType<'db>) {
+        self.notify_skipped_lazy_type_attributes();
     }
 
     fn visit_type(&self, db: &'db dyn Db, ty: Type<'db>) {
@@ -757,6 +763,10 @@ impl<'db> TypeVisitor<'db> for SourceParameterCollector<'_, 'db> {
 
     fn should_visit_lazy_type_attributes(&self) -> bool {
         false
+    }
+
+    fn visit_recursive_type(&self, _db: &'db dyn Db, _recursive: crate::types::RecursiveType<'db>) {
+        self.notify_skipped_lazy_type_attributes();
     }
 
     fn visit_type(&self, db: &'db dyn Db, ty: Type<'db>) {

@@ -605,6 +605,32 @@ def read(node: Node[int]):
     reveal_type(node.get("leaf"))  # revealed: type[int]
 ```
 
+## Recursive value types used as class attributes
+
+The `child` field refers to the same value union with another `list` around its type argument.
+Looking up a class attribute with that type does not require expanding every specialization.
+
+```py
+from typing import cast
+from typing_extensions import TypedDict
+from ty_extensions._internal import TypeOf
+
+class Node[T](TypedDict, closed=True):
+    leaf: int
+    child: TypeOf[next(iter(cast("Node[list[T]]", {}).values()))]
+
+class Holder:
+    attr = cast(Node[int], {})["child"]
+
+Holder.attr  # no diagnostic
+```
+
+The recursive alternative does not make these values assignable to `str`.
+
+```py
+text: str = Holder.attr  # error: [invalid-assignment]
+```
+
 ## Mutually recursive TypedDict value types
 
 These declarations are accepted even though checking either field refers to the other class's

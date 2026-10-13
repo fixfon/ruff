@@ -2,6 +2,7 @@ use std::hash::{Hash, Hasher};
 
 use crate::Db;
 use crate::ProgramEnvironment;
+use crate::types::recursive::TypeInspector;
 use ruff_python_ast as ast;
 use ruff_python_ast::name::Name;
 use rustc_hash::FxHashMap;
@@ -115,7 +116,9 @@ fn typed_dict_pattern_domain_satisfies<'db>(
     ty: Type<'db>,
     predicate: &mut impl FnMut(TypedDictType<'db>) -> bool,
 ) -> bool {
-    TypeTraversal::new(env, TypedDictPatternDomain).visit_with(db, ty, predicate)
+    TypeTraversal::with_root(env, TypedDictPatternDomain, |root| {
+        root.visit_with(db, ty, predicate)
+    })
 }
 
 struct TypedDictPatternDomain;
@@ -498,20 +501,29 @@ pub(crate) fn class_pattern_positional_result<'db>(
         {
             Some(ClassPatternPositionalResult::Limit(0))
         }
-        ClassMatchArgs::Defined { member_type, .. } => {
-            let match_args = member_type.resolve_type_alias(db);
-            if let Some(limit) = match_args.exact_tuple_instance_spec(db).and_then(|tuple| {
-                tuple
-                    .as_fixed_length()
-                    .map(super::tuple::FixedLengthTuple::len)
-            }) {
-                Some(ClassPatternPositionalResult::Limit(limit))
-            } else {
-                match_args
-                    .is_disjoint_from(db, env, Type::homogeneous_tuple(db, env, Type::unknown()))
-                    .then_some(ClassPatternPositionalResult::InvalidType(match_args))
-            }
-        }
+        ClassMatchArgs::Defined { member_type, .. } => TypeInspector::inspect_root(
+            db,
+            env,
+            member_type,
+            |_, _| None,
+            |_, match_args| {
+                if let Some(limit) = match_args.exact_tuple_instance_spec(db).and_then(|tuple| {
+                    tuple
+                        .as_fixed_length()
+                        .map(super::tuple::FixedLengthTuple::len)
+                }) {
+                    Some(ClassPatternPositionalResult::Limit(limit))
+                } else {
+                    match_args
+                        .is_disjoint_from(
+                            db,
+                            env,
+                            Type::homogeneous_tuple(db, env, Type::unknown()),
+                        )
+                        .then_some(ClassPatternPositionalResult::InvalidType(match_args))
+                }
+            },
+        ),
         ClassMatchArgs::Undefined | ClassMatchArgs::PossiblyUndefined => None,
     }
 }
@@ -773,11 +785,9 @@ fn definite_match_pattern_type_for_subject_cached<'pattern, 'db>(
         if let Some(independent) = subject_independent_definite_match_pattern_type(db, env, kind) {
             independent
         } else {
-            TypeTraversal::new(env, DefinitePattern(kind)).visit_with(
-                db,
-                subject_ty,
-                (&mut *cache, subject_ty),
-            )
+            TypeTraversal::with_root(env, DefinitePattern(kind), |root| {
+                root.visit_with(db, subject_ty, (&mut *cache, subject_ty))
+            })
         };
     if cacheable {
         cache.insert(key, result);
@@ -1102,11 +1112,9 @@ fn try_sequence_pattern_binding_fallthrough_type<'db>(
     subject_ty: Type<'db>,
     budget: &mut ExactTuplePatternExpansionBudget,
 ) -> Result<Type<'db>, ()> {
-    TypeTraversal::new(env, SequencePatternFallthrough(kind)).visit_with(
-        db,
-        subject_ty,
-        (budget, subject_ty),
-    )
+    TypeTraversal::with_root(env, SequencePatternFallthrough(kind), |root| {
+        root.visit_with(db, subject_ty, (budget, subject_ty))
+    })
 }
 
 struct SequencePatternFallthrough<'pattern, 'db>(&'pattern SequencePatternPredicateKind<'db>);
@@ -1289,7 +1297,7 @@ fn is_same_enum_pattern_domain<'db>(
     ty: Type<'db>,
     right: EnumLiteralType<'db>,
 ) -> bool {
-    TypeTraversal::new(env, EnumPatternDomain(right)).visit(db, ty)
+    TypeTraversal::with_root(env, EnumPatternDomain(right), |root| root.visit(db, ty))
 }
 
 struct EnumPatternDomain<'db>(EnumLiteralType<'db>);

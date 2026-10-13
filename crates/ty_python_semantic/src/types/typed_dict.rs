@@ -1,3 +1,4 @@
+use crate::types::recursive::TypeInspector;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, btree_map::Entry};
 use std::ops::{Deref, DerefMut};
@@ -82,7 +83,7 @@ impl<'db> TypedDictOpenness<'db> {
     /// class ByClosed(TypedDict, closed=True): ...
     /// ```
     pub(crate) fn extra(db: &'db dyn Db, declared_ty: Type<'db>, is_read_only: bool) -> Self {
-        if declared_ty.resolve_type_alias(db).is_never() {
+        if declared_ty.has_outer_type(db, |ty| ty.is_never()) {
             Self::Closed
         } else {
             Self::Extra(TypedDictExtraItems {
@@ -1949,8 +1950,7 @@ pub(crate) fn extract_unpacked_typed_dict_from_value_type<'db>(
     env: &ProgramEnvironment<'db>,
     ty: Type<'db>,
 ) -> Option<UnpackedTypedDict<'db>> {
-    TypeTraversal::new(env, UnpackTypedDict)
-        .visit(db, ty)
+    TypeTraversal::with_root(env, UnpackTypedDict, |root| root.visit(db, ty))
         .ok()
         .flatten()
 }
@@ -2192,28 +2192,37 @@ fn merge_unpacked_key_definitions<'db>(
 /// `TypedDict` target, or a type alias resolving to one.
 pub(crate) fn extract_unpacked_typed_dict_keys_from_kwargs_annotation<'db>(
     db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
     annotated_type: Type<'db>,
     annotation_flags: TypeExpressionFlags,
 ) -> Option<BTreeMap<Name, UnpackedTypedDictKey<'db>>> {
-    let typed_dict = annotation_flags
-        .contains(TypeExpressionFlags::UNPACK)
-        .then(|| annotated_type.resolve_type_alias(db).as_typed_dict())??;
+    TypeInspector::inspect_root(
+        db,
+        env,
+        annotated_type,
+        |_, _| None,
+        |_, annotated_type| {
+            let typed_dict = annotation_flags
+                .contains(TypeExpressionFlags::UNPACK)
+                .then(|| annotated_type.as_typed_dict())??;
 
-    Some(
-        typed_dict
-            .items(db)
-            .iter()
-            .map(|(name, field)| {
-                (
-                    name.clone(),
-                    UnpackedTypedDictKey {
-                        value_ty: field.declared_ty,
-                        is_required: field.is_required(),
-                        definition: field.first_declaration(),
-                    },
-                )
-            })
-            .collect(),
+            Some(
+                typed_dict
+                    .items(db)
+                    .iter()
+                    .map(|(name, field)| {
+                        (
+                            name.clone(),
+                            UnpackedTypedDictKey {
+                                value_ty: field.declared_ty,
+                                is_required: field.is_required(),
+                                definition: field.first_declaration(),
+                            },
+                        )
+                    })
+                    .collect(),
+            )
+        },
     )
 }
 
@@ -2237,15 +2246,25 @@ pub(super) fn infer_unpacked_keyword_types<'db>(
         .collect()
 }
 
-fn unpacked_keyword_is_gradual<'db>(db: &'db dyn Db, ty: Type<'db>) -> bool {
-    match ty.resolve_type_alias(db) {
-        ty if ty.is_never() || ty.is_dynamic() => true,
-        Type::Union(union) => union
-            .elements(db)
-            .iter()
-            .any(|element| element.resolve_type_alias(db).is_dynamic()),
-        _ => false,
-    }
+fn unpacked_keyword_is_gradual<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    ty: Type<'db>,
+) -> bool {
+    TypeInspector::inspect_root(
+        db,
+        env,
+        ty,
+        |_, _| false,
+        |_, ty| match ty {
+            ty if ty.is_never() || ty.is_dynamic() => true,
+            Type::Union(union) => union
+                .elements(db)
+                .iter()
+                .any(|element| element.has_outer_type(db, |ty| ty.is_dynamic())),
+            _ => false,
+        },
+    )
 }
 
 /// Collects constructor keys that are guaranteed to be provided by keyword arguments.
@@ -2333,7 +2352,7 @@ fn collect_guaranteed_keys_from_merged_unpacked_keyword<'db>(
         return;
     }
 
-    if unpacked_keyword_is_gradual(db, unpacked_type) {
+    if unpacked_keyword_is_gradual(db, env, unpacked_type) {
         provided_keys.extend(typed_dict.items(db).keys().cloned());
     } else if let Some(unpacked_keys) =
         extract_unpacked_typed_dict_keys_from_value_type(db, env, unpacked_type)
@@ -3069,7 +3088,7 @@ fn validate_merged_unpacked_keyword_argument<'db, 'ast>(
 
     // Never and Dynamic types are special: they can have any keys, so we skip validation and mark
     // all target keys as provided.
-    if unpacked_keyword_is_gradual(db, unpacked_type) {
+    if unpacked_keyword_is_gradual(db, env, unpacked_type) {
         shadowed_keys.extend(items.keys().cloned());
         for key_name in items.keys() {
             guaranteed_keys.entry(key_name.clone()).or_insert(None);
@@ -3318,7 +3337,7 @@ impl<'db> TypedDictField<'db> {
 
     /// Returns `false` for optional fields whose declared type is uninhabited.
     pub(crate) fn may_be_present(&self, db: &'db dyn Db) -> bool {
-        self.is_required() || !self.declared_ty.resolve_type_alias(db).is_never()
+        self.is_required() || !self.declared_ty.has_outer_type(db, |ty| ty.is_never())
     }
 
     pub(crate) const fn first_declaration(&self) -> Option<Definition<'db>> {

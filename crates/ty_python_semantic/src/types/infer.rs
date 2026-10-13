@@ -44,6 +44,7 @@
 //! be considered a bug.)
 
 use crate::ProgramEnvironment;
+use crate::types::recursive::TypeInspector;
 use itertools::Either;
 use ruff_db::parsed::parsed_module;
 use ruff_python_ast as ast;
@@ -59,8 +60,8 @@ use crate::types::function::{FunctionDecorators, FunctionType};
 use crate::types::generics::Specialization;
 use crate::types::unpacker::{UnpackResult, Unpacker};
 use crate::types::{
-    ApplyTypeMappingVisitor, ClassLiteral, KnownClass, RecursiveType, StaticClassLiteral, Type,
-    TypeAndQualifiers, TypeQualifiers,
+    ClassLiteral, KnownClass, RecursiveType, StaticClassLiteral, Type, TypeAndQualifiers,
+    TypeQualifiers,
 };
 use crate::{Db, FxIndexSet};
 
@@ -890,23 +891,37 @@ impl<'db> TypeContext<'db> {
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
     ) -> Option<Cow<'db, [Type<'db>]>> {
-        let union = self.annotation?.as_union_like(db)?;
-
-        let targets = if union.has_aliases(db) {
-            let expanded = union.expand_aliases(db, &ApplyTypeMappingVisitor::new(env));
-            if let Some(union) = expanded.as_union_like(db) {
-                Cow::Borrowed(union.elements(db))
-            } else {
-                Cow::Owned(vec![expanded])
-            }
-        } else {
-            Cow::Borrowed(union.elements(db))
-        };
-
-        // TODO: We could theoretically attempt to narrow to every element of
-        // the power set of this union. However, this leads to an exponential
-        // explosion of inference attempts, and is rarely needed in practice.
-        Some(targets)
+        fn targets<'db>(
+            db: &'db dyn Db,
+            inspector: &TypeInspector<'_, 'db>,
+            ty: Type<'db>,
+        ) -> Option<Cow<'db, [Type<'db>]>> {
+            inspector.inspect(
+                db,
+                ty,
+                |_, _| None,
+                |inspector, ty| {
+                    let union = match ty {
+                        Type::Union(union) => union,
+                        Type::NewTypeInstance(newtype) => {
+                            return targets(db, inspector, newtype.concrete_base_type(db));
+                        }
+                        _ => return None,
+                    };
+                    if union.has_aliases(db) {
+                        let expanded = union.expand_aliases(db, inspector.mapping_visitor());
+                        Some(match expanded {
+                            Type::Union(union) => Cow::Borrowed(union.elements(db)),
+                            _ => Cow::Owned(vec![expanded]),
+                        })
+                    } else {
+                        Some(Cow::Borrowed(union.elements(db)))
+                    }
+                },
+            )
+        }
+        // Trying the power set of these alternatives would require exponentially many attempts.
+        TypeInspector::scope(env, |inspector| targets(db, inspector, self.annotation?))
     }
 }
 

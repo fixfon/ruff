@@ -1,4 +1,5 @@
 use crate::ProgramEnvironment;
+use crate::types::recursive::TypeInspector;
 use char_str::CharStr;
 use ruff_db::parsed::parsed_module;
 use ruff_python_ast::{
@@ -25,9 +26,9 @@ use crate::types::known_instance::FieldInstance;
 use crate::types::member::class_member;
 use crate::types::special_form::SpecialFormType;
 use crate::types::{
-    ApplyTypeMappingVisitor, ClassBase, ClassType, DataclassTransformerParams, FunctionType,
-    KnownClass, KnownFunction, KnownInstanceType, KnownUnion, Parameter, Specialization,
-    StaticClassLiteral, Type, UnionType, definition_expression_type,
+    ClassBase, ClassType, DataclassTransformerParams, FunctionType, KnownClass, KnownFunction,
+    KnownInstanceType, KnownUnion, Parameter, Specialization, StaticClassLiteral, Type, UnionType,
+    definition_expression_type,
 };
 
 /// Pydantic treats underscore-prefixed annotations as private instance attributes.
@@ -992,7 +993,9 @@ fn lax_input_type<'db>(
     env: &ProgramEnvironment<'db>,
     field_type: Type<'db>,
 ) -> Type<'db> {
-    lax_input_type_impl(db, env, field_type, &mut FxHashSet::default())
+    TypeInspector::scope(env, |inspector| {
+        lax_input_type_impl(db, env, field_type, &mut FxHashSet::default(), inspector)
+    })
 }
 
 fn lax_input_type_impl<'db>(
@@ -1000,32 +1003,27 @@ fn lax_input_type_impl<'db>(
     env: &ProgramEnvironment<'db>,
     field_type: Type<'db>,
     expanding_types: &mut FxHashSet<Type<'db>>,
+    inspector: &TypeInspector<'_, 'db>,
+) -> Type<'db> {
+    inspector.inspect(
+        db,
+        field_type,
+        |_, _| Type::any(),
+        |inspector, field_type| {
+            lax_input_type_body(db, env, field_type, expanding_types, inspector)
+        },
+    )
+}
+
+fn lax_input_type_body<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    field_type: Type<'db>,
+    expanding_types: &mut FxHashSet<Type<'db>>,
+    inspector: &TypeInspector<'_, 'db>,
 ) -> Type<'db> {
     if field_type.is_none(db) || matches!(field_type, Type::LiteralValue(_) | Type::SubclassOf(_)) {
         return field_type;
-    }
-
-    if let Type::TypeAlias(alias) = field_type {
-        if !expanding_types.insert(field_type) {
-            return Type::any();
-        }
-        let result = lax_input_type_impl(db, env, alias.value_type(db), expanding_types);
-        expanding_types.remove(&field_type);
-        return result;
-    }
-
-    if let Type::Recursive(recursive) = field_type {
-        // Guard the constructor: recursive arguments can grow without repeating a specialization.
-        let constructor = Type::Recursive(recursive.constructor(db));
-        if !expanding_types.insert(constructor) {
-            return Type::any();
-        }
-        let result = recursive
-            .unfold(db, &ApplyTypeMappingVisitor::new(env))
-            .map(|unfolded| lax_input_type_impl(db, env, unfolded, expanding_types))
-            .unwrap_or(Type::any());
-        expanding_types.remove(&constructor);
-        return result;
     }
 
     if field_type.as_union().and_then(|union| union.known(db)) == Some(KnownUnion::Float) {
@@ -1039,11 +1037,12 @@ fn lax_input_type_impl<'db>(
             union
                 .elements(db)
                 .iter()
-                .map(|element| lax_input_type_impl(db, env, *element, expanding_types)),
+                .map(|element| lax_input_type_impl(db, env, *element, expanding_types, inspector)),
         );
     }
 
-    if let Some(input_type) = root_model_input_type(db, env, field_type, expanding_types) {
+    if let Some(input_type) = root_model_input_type(db, env, field_type, expanding_types, inspector)
+    {
         return input_type;
     }
 
@@ -1075,6 +1074,7 @@ fn lax_input_type_impl<'db>(
             env,
             elements.homogeneous_element_type(db, env),
             expanding_types,
+            inspector,
         );
         return KnownClass::Iterable.to_specialized_instance(db, env, &[element_type]);
     }
@@ -1088,7 +1088,7 @@ fn lax_input_type_impl<'db>(
         let [key_type, value_type] = specialization.types(db) else {
             return Type::any();
         };
-        let value_type = lax_input_type_impl(db, env, *value_type, expanding_types);
+        let value_type = lax_input_type_impl(db, env, *value_type, expanding_types, inspector);
         return KnownClass::Mapping.to_specialized_instance(db, env, &[*key_type, value_type]);
     }
 
@@ -1165,6 +1165,7 @@ fn root_model_input_type<'db>(
     env: &ProgramEnvironment<'db>,
     field_type: Type<'db>,
     expanding_types: &mut FxHashSet<Type<'db>>,
+    inspector: &TypeInspector<'_, 'db>,
 ) -> Option<Type<'db>> {
     let (class, specialization) = field_type
         .nominal_class(db, env)?
@@ -1185,7 +1186,8 @@ fn root_model_input_type<'db>(
     if !expanding_types.insert(field_type) {
         return Some(Type::any());
     }
-    let root_input_type = lax_input_type_impl(db, env, root_field.declared_ty, expanding_types);
+    let root_input_type =
+        lax_input_type_impl(db, env, root_field.declared_ty, expanding_types, inspector);
 
     expanding_types.remove(&field_type);
     // In lax mode, Pydantic accepts a Box[str] when a Box[int] is expected, so we widen

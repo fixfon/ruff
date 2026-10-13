@@ -137,7 +137,7 @@ fn expand_union_elements<'db>(
     unfold_named: bool,
 ) -> (Vec<Type<'db>>, RecursivelyDefined) {
     let recursively_defined = Cell::new(RecursivelyDefined::No);
-    let elements = TypeTraversal::from_mapping_visitor(
+    let elements = TypeTraversal::with_mapping_visitor(
         visitor,
         ExpandUnion {
             seen: RefCell::default(),
@@ -146,8 +146,8 @@ fn expand_union_elements<'db>(
             cycle_recovery,
             expand_named: unfold_named,
         },
+        |root| root.visit_with(db, ty, UnionExpansionState::default()),
     )
-    .visit_with(db, ty, UnionExpansionState::default())
     .unwrap_or_else(|()| vec![ty]);
     (elements, recursively_defined.get())
 }

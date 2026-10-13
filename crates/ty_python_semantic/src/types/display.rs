@@ -274,6 +274,7 @@ impl<'db> DisplaySettings<'db> {
         }
 
         let collector = AmbiguousNameCollector {
+            mapping: ApplyTypeMappingVisitor::new(env),
             env,
             visited_types: RefCell::default(),
             active_recursive_types: ActiveRecursionDetector::default(),
@@ -583,6 +584,7 @@ impl QualificationLevel {
 }
 
 struct AmbiguousNameCollector<'a, 'db> {
+    mapping: ApplyTypeMappingVisitor<'a, 'db>,
     env: &'a ProgramEnvironment<'db>,
     visited_types: RefCell<FxHashSet<Type<'db>>>,
     active_recursive_types: ActiveRecursionDetector<TypeIdentity<'db>>,
@@ -719,14 +721,12 @@ impl<'db> TypeVisitor<'db> for AmbiguousNameCollector<'_, 'db> {
 
     fn visit_recursive_type(&self, db: &'db dyn Db, recursive: RecursiveType<'db>) {
         if recursive.alias(db).is_none() {
-            self.active_recursive_types.visit(
+            self.active_recursive_types.visit_with_expansion(
                 &Type::Recursive(recursive).to_type_identity(db),
+                &self.mapping,
                 || (),
-                || {
-                    if let Some(unfolded) = recursive
-                        .unfold(db, &ApplyTypeMappingVisitor::new(self.env))
-                        .into_unfolded()
-                    {
+                |expansion| {
+                    if let Some(unfolded) = expansion.unfold(db, recursive).into_unfolded() {
                         self.visit_type(db, unfolded);
                     }
                 },
@@ -990,9 +990,28 @@ impl<'db> Type<'db> {
         db: &'db dyn Db,
         env: &'env ProgramEnvironment<'db>,
     ) -> Option<impl Display + 'env> {
-        let (ty, definition, name, generic_context, value_ty) = match self {
+        let display = |ty, definition, name, generic_context, value_ty| {
+            Some(DisplayTypeAliasDeclaration {
+                db,
+                env,
+                type_alias: TypeAliasDisplay {
+                    db,
+                    ty,
+                    definition,
+                    name,
+                    settings: DisplaySettings::from_possibly_ambiguous_types(
+                        db,
+                        env,
+                        [ty, value_ty],
+                    ),
+                },
+                generic_context,
+                value_ty,
+            })
+        };
+        match self {
             Type::KnownInstance(KnownInstanceType::TypeAliasType(alias))
-            | Type::TypeAlias(alias) => (
+            | Type::TypeAlias(alias) => display(
                 Type::TypeAlias(alias),
                 alias.definition(db),
                 alias.name(db),
@@ -1002,31 +1021,26 @@ impl<'db> Type<'db> {
             Type::Recursive(recursive) => {
                 let (definition, name) = recursive.alias(db)?;
                 let constructor = recursive.constructor(db);
-                (
+                let mapping = ApplyTypeMappingVisitor::new(env);
+                let guard = crate::types::CycleDetector::<(), Type<'db>, (), 1>::new(());
+                guard.visit_active_with_expansion(
+                    db,
                     Type::Recursive(constructor),
-                    definition,
-                    name,
-                    constructor.parameters(db),
-                    constructor
-                        .unfold(db, &ApplyTypeMappingVisitor::new(env))
-                        .into_type(),
+                    &mapping,
+                    |visit| {
+                        let expansion = visit.ok()?;
+                        display(
+                            Type::Recursive(constructor),
+                            definition,
+                            name,
+                            constructor.parameters(db),
+                            expansion.unfold(db, constructor).into_type(),
+                        )
+                    },
                 )
             }
-            _ => return None,
-        };
-        Some(DisplayTypeAliasDeclaration {
-            db,
-            env,
-            type_alias: TypeAliasDisplay {
-                db,
-                ty,
-                definition,
-                name,
-                settings: DisplaySettings::from_possibly_ambiguous_types(db, env, [ty, value_ty]),
-            },
-            generic_context,
-            value_ty,
-        })
+            _ => None,
+        }
     }
 }
 
@@ -4213,7 +4227,7 @@ mod tests {
         return_ty: Option<Type<'db>>,
     ) -> String {
         Signature::new(
-            Parameters::from_annotation(db, parameters),
+            Parameters::from_annotation(db, &db.program_environment(), parameters),
             return_ty.unwrap_or(Type::unknown()),
         )
         .display(db, &db.program_environment())
@@ -4226,7 +4240,7 @@ mod tests {
         return_ty: Option<Type<'db>>,
     ) -> String {
         Signature::new(
-            Parameters::from_annotation(db, parameters),
+            Parameters::from_annotation(db, &db.program_environment(), parameters),
             return_ty.unwrap_or(Type::unknown()),
         )
         .display_with(

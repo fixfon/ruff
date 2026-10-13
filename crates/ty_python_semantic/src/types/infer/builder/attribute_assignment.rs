@@ -791,7 +791,7 @@ impl<'db> AssignmentAttributeWriteEvaluator<'_, 'db, '_, '_> {
         emit_diagnostics: bool,
     ) -> bool {
         let db = self.builder.db();
-        TypeTraversal::new(
+        TypeTraversal::with_root(
             self.builder.program_environment(),
             DescriptorWrite {
                 receiver_ty,
@@ -799,8 +799,8 @@ impl<'db> AssignmentAttributeWriteEvaluator<'_, 'db, '_, '_> {
                 required_definedness,
                 emit_diagnostics,
             },
+            |root| root.visit_with(db, descriptor_ty, self),
         )
-        .visit_with(db, descriptor_ty, self)
     }
 
     /// Check the setter call and return whether the setter is always or only possibly present.

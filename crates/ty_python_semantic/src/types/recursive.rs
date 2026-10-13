@@ -67,13 +67,16 @@
 //! construction and type display expand their completed bodies.
 
 use std::cell::OnceCell;
+use std::hash::Hash;
 
 use salsa::plumbing::AsId;
 use ty_python_core::definition::Definition;
 use ty_python_core::place_table;
 
 use super::constraints::{ConstraintSet, IteratorConstraintsExtension};
-use super::cyclic::{CycleDetector, CycleKind};
+use super::cyclic::{
+    ActiveRecursionDetector, CycleDetector, CycleKind, HasIdentity, TypeTransformer,
+};
 use super::generics::{ApplySpecialization, Specialization};
 use super::relation::{TypeRelation, TypeRelationChecker};
 use super::type_alias::AliasCycleSummary;
@@ -84,6 +87,156 @@ use super::{
     VarianceTerm,
 };
 use crate::{Db, ProgramEnvironment};
+
+/// Access to recursive bodies while a caller's recursion guard is active.
+///
+/// A mapping visitor alone does not establish a recursion guard for the operation that reads the
+/// unfolded body. This context is borrowed inside a guarded visit and cannot be constructed by a
+/// type operation. The caller's mapping visitor remains shared throughout that visit.
+pub(super) struct TypeExpansionContext<'a, 'env, 'db> {
+    mapping: &'a ApplyTypeMappingVisitor<'env, 'db>,
+}
+
+impl<'db> TypeExpansionContext<'_, '_, 'db> {
+    pub(super) fn unfold(
+        &self,
+        db: &'db dyn Db,
+        recursive: RecursiveType<'db>,
+    ) -> UnfoldResult<'db> {
+        recursive.unfold(db, self.mapping)
+    }
+
+    /// Resolve the outer aliases of a type covered by the caller's active recursion guard.
+    pub(super) fn resolve_aliases(&self, db: &'db dyn Db, ty: Type<'db>) -> Type<'db> {
+        TypeTraversal::with_mapping_visitor(self.mapping, InspectType, |traversal| {
+            traversal.inspect(db, ty, |ty, _| ty, |_, ty| ty)
+        })
+    }
+}
+
+impl<'db, Tag, T, R: Clone, const N: usize> CycleDetector<'db, Tag, T, R, N>
+where
+    T: Hash + Eq + Clone + HasIdentity<'db>,
+{
+    /// Inspect recursive bodies under this detector's existing key and cycle policy.
+    pub(super) fn visit_with_expansion(
+        &self,
+        db: &'db dyn Db,
+        item: T,
+        mapping: &ApplyTypeMappingVisitor<'_, 'db>,
+        compute: impl FnOnce(&TypeExpansionContext<'_, '_, 'db>) -> R,
+    ) -> R {
+        self.visit(db, item, || compute(&TypeExpansionContext { mapping }))
+    }
+
+    pub(super) fn try_visit_with_expansion(
+        &self,
+        db: &'db dyn Db,
+        item: T,
+        mapping: &ApplyTypeMappingVisitor<'_, 'db>,
+        reuse_cached: impl FnOnce(&R) -> bool,
+        compute: impl FnOnce(&TypeExpansionContext<'_, '_, 'db>) -> R,
+    ) -> Result<R, T> {
+        self.try_visit(db, item, reuse_cached, || {
+            compute(&TypeExpansionContext { mapping })
+        })
+    }
+}
+
+impl<'db, Tag, T, const N: usize> CycleDetector<'db, Tag, T, (), N>
+where
+    T: Hash + Eq + Clone + HasIdentity<'db>,
+{
+    pub(super) fn visit_active_with_expansion<R>(
+        &self,
+        db: &'db dyn Db,
+        item: T,
+        mapping: &ApplyTypeMappingVisitor<'_, 'db>,
+        compute: impl FnOnce(Result<&TypeExpansionContext<'_, '_, 'db>, CycleKind>) -> R,
+    ) -> R {
+        self.visit_active(db, item, |cycle| match cycle {
+            Some(kind) => compute(Err(kind)),
+            None => compute(Ok(&TypeExpansionContext { mapping })),
+        })
+    }
+}
+
+impl<T: Hash + Eq + Clone> ActiveRecursionDetector<T> {
+    pub(super) fn visit_with_expansion<'db, R>(
+        &self,
+        item: &T,
+        mapping: &ApplyTypeMappingVisitor<'_, 'db>,
+        on_cycle: impl FnOnce() -> R,
+        compute: impl FnOnce(&TypeExpansionContext<'_, '_, 'db>) -> R,
+    ) -> R {
+        self.visit(item, on_cycle, || {
+            compute(&TypeExpansionContext { mapping })
+        })
+    }
+}
+
+impl<'db, Tag> TypeTransformer<'db, Tag> {
+    pub(super) fn visit_type_with_expansion(
+        &self,
+        db: &'db dyn Db,
+        ty: Type<'db>,
+        mapping: &ApplyTypeMappingVisitor<'_, 'db>,
+        compute: impl FnOnce(&TypeExpansionContext<'_, '_, 'db>) -> Type<'db>,
+    ) -> Type<'db> {
+        self.visit_type(db, ty, || compute(&TypeExpansionContext { mapping }))
+    }
+}
+
+/// Recursion and mapping state owned by a complete walk with operation-specific keys.
+pub(crate) struct TypeVisitorState<'env, 'db, Tag, T: HasIdentity<'db>, R, const N: usize> {
+    cycles: CycleDetector<'db, Tag, T, R, N>,
+    mapping: ApplyTypeMappingVisitor<'env, 'db>,
+}
+
+impl<'env, 'db, Tag, T: HasIdentity<'db>, R, const N: usize>
+    TypeVisitorState<'env, 'db, Tag, T, R, N>
+{
+    pub(super) fn new(env: &'env ProgramEnvironment<'db>, fallback: R) -> Self {
+        Self {
+            cycles: CycleDetector::new(fallback),
+            mapping: ApplyTypeMappingVisitor::new(env),
+        }
+    }
+}
+
+impl<'db, Tag, T, R: Clone, const N: usize> TypeVisitorState<'_, 'db, Tag, T, R, N>
+where
+    T: Hash + Eq + Clone + HasIdentity<'db>,
+{
+    pub(super) fn visit(&self, db: &'db dyn Db, item: T, compute: impl FnOnce() -> R) -> R {
+        self.cycles.visit(db, item, compute)
+    }
+
+    pub(super) fn visit_with_expansion(
+        &self,
+        db: &'db dyn Db,
+        item: T,
+        compute: impl FnOnce(&TypeExpansionContext<'_, '_, 'db>) -> R,
+    ) -> R {
+        self.cycles
+            .visit_with_expansion(db, item, &self.mapping, compute)
+    }
+}
+
+impl<'db, Tag, T, const N: usize> TypeVisitorState<'_, 'db, Tag, T, (), N>
+where
+    T: Hash + Eq + Clone + HasIdentity<'db>,
+{
+    pub(super) fn visit_active_with_expansion<R>(
+        &self,
+        db: &'db dyn Db,
+        item: T,
+        compute: impl FnOnce(Result<&TypeExpansionContext<'_, '_, 'db>, CycleKind>) -> R,
+    ) -> R {
+        self.cycles
+            .visit_active_with_expansion(db, item, &self.mapping, compute)
+    }
+}
 
 /// An operation on the outer shape of a type.
 ///
@@ -111,6 +264,20 @@ pub trait TypeOperation<'db, State = ()>: Sized {
         kind: CycleKind,
         state: State,
     ) -> Self::Output;
+
+    /// Consume one unfolded body while its binder remains active.
+    ///
+    /// Most operations continue inspecting its outer shape. Structural visitors can instead
+    /// visit the body themselves so their callbacks still observe aliases and other containers.
+    fn visit_recursive_body(
+        &self,
+        db: &'db dyn Db,
+        traversal: &TypeTraversal<'_, 'db, Self>,
+        body: Type<'db>,
+        state: State,
+    ) -> Self::Output {
+        traversal.visit_with(db, body, state)
+    }
 
     /// Process an alias or recursive type with its traversal guard active.
     ///
@@ -145,7 +312,7 @@ pub struct TypeTraversal<'env, 'db, O> {
 }
 
 impl<'env, 'db, O> TypeTraversal<'env, 'db, O> {
-    pub fn new(env: &'env ProgramEnvironment<'db>, operation: O) -> Self {
+    fn new(env: &'env ProgramEnvironment<'db>, operation: O) -> Self {
         Self {
             operation,
             env,
@@ -153,6 +320,15 @@ impl<'env, 'db, O> TypeTraversal<'env, 'db, O> {
             mapping: TraversalMapping::Owned(OnceCell::new()),
             active: CycleDetector::new(()),
         }
+    }
+
+    /// Run an operation with one borrowed traversal for its entire recursion.
+    pub fn with_root<R>(
+        env: &'env ProgramEnvironment<'db>,
+        operation: O,
+        visit: impl FnOnce(&Self) -> R,
+    ) -> R {
+        visit(&Self::new(env, operation))
     }
 
     pub(crate) fn environment(&self) -> &ProgramEnvironment<'db> {
@@ -169,7 +345,7 @@ impl<'env, 'db, O> TypeTraversal<'env, 'db, O> {
         }
     }
 
-    pub(super) fn new_with_recursion_context(
+    fn new_with_recursion_context(
         env: &'env ProgramEnvironment<'db>,
         operation: O,
         context: &'env TypeRecursionContext<'db>,
@@ -180,8 +356,17 @@ impl<'env, 'db, O> TypeTraversal<'env, 'db, O> {
         }
     }
 
+    pub(super) fn with_recursion_context<R>(
+        env: &'env ProgramEnvironment<'db>,
+        operation: O,
+        context: &'env TypeRecursionContext<'db>,
+        visit: impl FnOnce(&Self) -> R,
+    ) -> R {
+        visit(&Self::new_with_recursion_context(env, operation, context))
+    }
+
     /// Start a traversal inside a transformation without replacing that transformation's guards.
-    pub(super) fn from_mapping_visitor(
+    fn from_mapping_visitor(
         visitor: &'env ApplyTypeMappingVisitor<'env, 'db>,
         operation: O,
     ) -> Self {
@@ -192,6 +377,14 @@ impl<'env, 'db, O> TypeTraversal<'env, 'db, O> {
             mapping: TraversalMapping::Borrowed(visitor),
             active: CycleDetector::new(()),
         }
+    }
+
+    pub(super) fn with_mapping_visitor<R>(
+        visitor: &'env ApplyTypeMappingVisitor<'env, 'db>,
+        operation: O,
+        visit: impl FnOnce(&Self) -> R,
+    ) -> R {
+        visit(&Self::from_mapping_visitor(visitor, operation))
     }
 
     pub fn visit(&self, db: &'db dyn Db, ty: Type<'db>) -> O::Output
@@ -229,7 +422,9 @@ impl<'env, 'db, O> TypeTraversal<'env, 'db, O> {
                     self.operation
                         .visit_alias_like(db, self, ty, state, |state| {
                             match recursive.unfold(db, self.mapping_visitor()) {
-                                UnfoldResult::Unfolded(body) => self.visit_with(db, body, state),
+                                UnfoldResult::Unfolded(body) => {
+                                    self.operation.visit_recursive_body(db, self, body, state)
+                                }
                                 UnfoldResult::Unchanged(_) => {
                                     self.operation.visit(db, self, ty, state)
                                 }
@@ -255,6 +450,69 @@ impl<'env, 'db, O> TypeTraversal<'env, 'db, O> {
 enum TraversalMapping<'env, 'db> {
     Owned(OnceCell<ApplyTypeMappingVisitor<'env, 'db>>),
     Borrowed(&'env ApplyTypeMappingVisitor<'env, 'db>),
+}
+
+/// A scoped inspection whose callbacks keep the alias-expansion guard active.
+pub(super) struct InspectType;
+
+pub(super) type TypeInspector<'env, 'db> = TypeTraversal<'env, 'db, InspectType>;
+
+impl<'db, R, C, F> TypeOperation<'db, (C, F)> for InspectType
+where
+    C: FnOnce(Type<'db>, CycleKind) -> R,
+    F: FnOnce(&TypeInspector<'_, 'db>, Type<'db>) -> R,
+{
+    type Output = R;
+
+    fn on_cycle(
+        &self,
+        _traversal: &TypeInspector<'_, 'db>,
+        ty: Type<'db>,
+        kind: CycleKind,
+        (on_cycle, _inspect): (C, F),
+    ) -> R {
+        on_cycle(ty, kind)
+    }
+
+    fn visit(
+        &self,
+        _db: &'db dyn Db,
+        traversal: &TypeInspector<'_, 'db>,
+        ty: Type<'db>,
+        (_on_cycle, inspect): (C, F),
+    ) -> R {
+        inspect(traversal, ty)
+    }
+}
+
+impl<'env, 'db> TypeInspector<'env, 'db> {
+    pub(super) fn scope<R>(
+        env: &'env ProgramEnvironment<'db>,
+        inspect: impl FnOnce(&Self) -> R,
+    ) -> R {
+        inspect(&Self::new(env, InspectType))
+    }
+
+    /// Start a complete inspection. Recursive helpers borrow the inspector passed to `inspect`.
+    pub(super) fn inspect_root<R>(
+        db: &'db dyn Db,
+        env: &'env ProgramEnvironment<'db>,
+        ty: Type<'db>,
+        on_cycle: impl FnOnce(Type<'db>, CycleKind) -> R,
+        inspect: impl FnOnce(&TypeInspector<'_, 'db>, Type<'db>) -> R,
+    ) -> R {
+        Self::new(env, InspectType).inspect(db, ty, on_cycle, inspect)
+    }
+
+    pub(super) fn inspect<R>(
+        &self,
+        db: &'db dyn Db,
+        ty: Type<'db>,
+        on_cycle: impl FnOnce(Type<'db>, CycleKind) -> R,
+        inspect: impl FnOnce(&TypeInspector<'_, 'db>, Type<'db>) -> R,
+    ) -> R {
+        self.visit_with(db, ty, (on_cycle, inspect))
+    }
 }
 
 /// A recursive variable named by its binder's query cycle.
@@ -585,7 +843,7 @@ impl<'db> RecursiveType<'db> {
     /// Materializing the body can compare an argument with its materialization, which can unfold
     /// another application of this constructor. Keep the caller's equivalence guard so growing
     /// arguments do not restart that comparison with an empty recursion stack.
-    pub(in crate::types) fn unfold(
+    fn unfold(
         self,
         db: &'db dyn Db,
         visitor: &ApplyTypeMappingVisitor<'_, 'db>,
@@ -860,19 +1118,6 @@ impl<'db, T> UnfoldResult<'db, T> {
         match self {
             Self::Unfolded(value) => predicate(value),
             Self::Unchanged(_) => false,
-        }
-    }
-
-    /// Return whether unfolding made no progress or the contained value satisfies `predicate`.
-    #[inline]
-    #[expect(
-        clippy::wrong_self_convention,
-        reason = "Like Option::is_none_or, the predicate consumes the contained value."
-    )]
-    pub(crate) fn is_unchanged_or(self, predicate: impl FnOnce(T) -> bool) -> bool {
-        match self {
-            Self::Unfolded(value) => predicate(value),
-            Self::Unchanged(_) => true,
         }
     }
 

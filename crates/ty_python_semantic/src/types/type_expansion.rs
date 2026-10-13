@@ -24,6 +24,7 @@ pub(crate) fn expand_type<'db>(
     TypeExpander {
         db,
         env,
+        mapping: ApplyTypeMappingVisitor::new(env),
         visitor: CycleDetector::new(None),
     }
     .expand(ty)
@@ -38,6 +39,7 @@ pub(crate) fn expand_elements<'db>(
     TypeExpander {
         db,
         env,
+        mapping: ApplyTypeMappingVisitor::new(env),
         visitor: CycleDetector::new(None),
     }
     .expand_elements(elements)
@@ -48,6 +50,7 @@ pub(crate) fn expand_elements<'db>(
 struct TypeExpander<'a, 'db> {
     db: &'db dyn Db,
     env: &'a ProgramEnvironment<'db>,
+    mapping: ApplyTypeMappingVisitor<'a, 'db>,
     visitor: CycleDetector<'db, (), Type<'db>, Option<Vec<Type<'db>>>, 3>,
 }
 
@@ -139,13 +142,12 @@ impl<'db> TypeExpander<'_, 'db> {
             Type::TypeAlias(alias) => self
                 .visitor
                 .visit(db, ty, || self.expand(alias.value_type(db))),
-            Type::Recursive(recursive) => self.visitor.visit(db, ty, || {
-                self.expand(
-                    recursive
-                        .unfold(db, &ApplyTypeMappingVisitor::new(env))
-                        .into_unfolded()?,
-                )
-            }),
+            Type::Recursive(recursive) => {
+                self.visitor
+                    .visit_with_expansion(db, ty, &self.mapping, |expansion| {
+                        self.expand(expansion.unfold(db, recursive).into_unfolded()?)
+                    })
+            }
             // We don't handle `type[A | B]` here because it's already stored in the expanded form
             // i.e., `type[A] | type[B]` which is handled by the `Type::Union` case.
             _ => None,

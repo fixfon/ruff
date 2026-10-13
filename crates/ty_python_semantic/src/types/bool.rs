@@ -24,13 +24,13 @@ impl<'db> Type<'db> {
     /// This describes the value type; a compound expression can also fail to complete because
     /// of its operands, even when its inferred result type is inhabited.
     pub(crate) fn bool(&self, db: &'db dyn Db, env: &ProgramEnvironment<'db>) -> Truthiness {
-        TypeTraversal::new(
+        TypeTraversal::with_root(
             env,
             TryBool {
                 allow_short_circuit: true,
             },
+            |root| root.visit(db, *self),
         )
-        .visit(db, *self)
         .unwrap_or_else(|err| err.fallback_truthiness())
     }
 
@@ -45,13 +45,13 @@ impl<'db> Type<'db> {
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
     ) -> Result<Truthiness, BoolError<'db>> {
-        TypeTraversal::new(
+        TypeTraversal::with_root(
             env,
             TryBool {
                 allow_short_circuit: false,
             },
+            |root| root.visit(db, *self),
         )
-        .visit(db, *self)
     }
 }
 

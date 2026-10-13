@@ -3311,7 +3311,7 @@ fn completion_kind_from_type<'db>(
     env: &ProgramEnvironment<'db>,
     ty: Type<'db>,
 ) -> Option<CompletionKind> {
-    TypeTraversal::new(env, FindCompletionKind).visit(db, ty)
+    TypeTraversal::with_root(env, FindCompletionKind, |root| root.visit(db, ty))
 }
 
 struct FindCompletionKind;

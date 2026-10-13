@@ -42,6 +42,8 @@
 use std::convert::Infallible;
 use std::hint::cold_path;
 use std::marker::PhantomData;
+
+use crate::types::recursive::TypeInspector;
 use std::ops::ControlFlow;
 
 use super::generic_gradual_intersections::{GenericIntersection, generic_gradual_intersection};
@@ -768,7 +770,9 @@ impl<'db> UnionBuilder<'db> {
     pub(crate) fn add_in_place(&mut self, ty: Type<'db>) {
         ty.assert_not_recursive_var();
         let env = self.env.clone();
-        TypeTraversal::new(&env, BuildUnion).visit_with(self.db, ty, (self, false));
+        TypeTraversal::with_root(&env, BuildUnion, |root| {
+            root.visit_with(self.db, ty, (self, false));
+        });
     }
 
     fn add_in_place_impl(&mut self, ty: Type<'db>, traversal: &TypeTraversal<'_, 'db, BuildUnion>) {
@@ -1568,7 +1572,7 @@ impl<'db> IntersectionBuilder<'db> {
 
     /// Whether expanding a factor can introduce alternatives, including through De Morgan's law.
     fn is_disjunctive(db: &'db dyn Db, env: &ProgramEnvironment<'db>, ty: Type<'db>) -> bool {
-        TypeTraversal::new(env, IsDisjunctive).visit_with(db, ty, false)
+        TypeTraversal::with_root(env, IsDisjunctive, |root| root.visit_with(db, ty, false))
     }
 
     pub(crate) fn add_positive(mut self, ty: Type<'db>) -> Self {
@@ -1586,11 +1590,9 @@ impl<'db> IntersectionBuilder<'db> {
         negative: bool,
     ) -> ControlFlow<L::Break> {
         let env = self.env.clone();
-        TypeTraversal::new(&env, BuildIntersection::<L>(PhantomData)).visit_with(
-            self.db,
-            ty,
-            (self, negative),
-        )
+        TypeTraversal::with_root(&env, BuildIntersection::<L>(PhantomData), |root| {
+            root.visit_with(self.db, ty, (self, negative))
+        })
     }
 
     fn add_positive_impl<L: IntersectionLimits>(
@@ -1991,10 +1993,12 @@ impl<'db> InnerIntersectionBuilder<'db> {
         // A runtime class value of `TypeForm[T]` has type `type[T]`.
         match new_positive {
             Type::TypeForm(typeform) => {
-                if let Ok(narrowed) = SubclassOfType::try_from_instance(
+                if let Some(narrowed) = TypeInspector::inspect_root(
                     db,
                     env,
-                    typeform.type_argument(db).resolve_type_alias(db),
+                    typeform.type_argument(db),
+                    |_, _| None,
+                    |_, ty| SubclassOfType::try_from_instance(db, env, ty).ok(),
                 ) && self
                     .positive
                     .swap_remove(&KnownClass::Type.to_instance(db, env))
@@ -2008,13 +2012,17 @@ impl<'db> InnerIntersectionBuilder<'db> {
                         .iter()
                         .enumerate()
                         .find_map(|(index, positive)| match positive {
-                            Type::TypeForm(typeform) => SubclassOfType::try_from_instance(
+                            Type::TypeForm(typeform) => TypeInspector::inspect_root(
                                 db,
                                 env,
-                                typeform.type_argument(db).resolve_type_alias(db),
-                            )
-                            .ok()
-                            .map(|narrowed| (index, narrowed)),
+                                typeform.type_argument(db),
+                                |_, _| None,
+                                |_, ty| {
+                                    SubclassOfType::try_from_instance(db, env, ty)
+                                        .ok()
+                                        .map(|narrowed| (index, narrowed))
+                                },
+                            ),
                             _ => None,
                         })
                 {
